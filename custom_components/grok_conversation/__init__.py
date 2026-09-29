@@ -56,7 +56,9 @@ from .const import (
     CONF_VISION_MODEL,
     DEFAULT_AI_TASK_NAME,
     DOMAIN,
+    IMAGE_ASPECT_RATIO_COMPAT,
     IMAGE_ASPECT_RATIOS,
+    IMAGE_ASPECT_RATIOS_SDK,
     IMAGE_QUALITIES,
     IMAGE_QUALITY_DOCUMENTED,
     IMAGE_RESOLUTIONS,
@@ -134,9 +136,9 @@ def model_supports_image_quality(model: str | None) -> bool:
 def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[str, Any]:
     """Build kwargs for client.image.sample / sample_batch from service call data.
 
-    Never sends ``size`` or ``style``. Sends documented ``quality``
-    (``low``/``medium``/``auto``) only when the model supports it
-    (``grok-imagine-image-2.0``). Maps service ``response_format``
+    Never sends ``size`` or ``style``. Sends ``quality`` ``low``/``medium``
+    only when the model supports it (``grok-imagine-image-2.0``); omits
+    ``auto`` so the SDK default applies. Maps service ``response_format``
     ``url|b64_json`` to SDK ``image_format`` ``url|base64``.
     """
     global _QUALITY_UNSUPPORTED_WARNED
@@ -183,6 +185,10 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
         )
         quality = None
 
+    if quality == "auto":
+        # xai-sdk 1.19.0 only accepts low|medium; auto means "use SDK default".
+        quality = None
+
     if quality is not None and not model_supports_image_quality(model):
         if not _QUALITY_UNSUPPORTED_WARNED:
             _QUALITY_UNSUPPORTED_WARNED = True
@@ -192,6 +198,25 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
                 model,
             )
         quality = None
+
+    if aspect_ratio == "auto":
+        aspect_ratio = None
+    elif aspect_ratio in IMAGE_ASPECT_RATIO_COMPAT:
+        mapped_ratio = IMAGE_ASPECT_RATIO_COMPAT[aspect_ratio]
+        LOGGER.warning(
+            "generate_image aspect_ratio '%s' is not supported by xai-sdk; "
+            "using '%s'.",
+            aspect_ratio,
+            mapped_ratio,
+        )
+        aspect_ratio = mapped_ratio
+    elif aspect_ratio is not None and aspect_ratio not in IMAGE_ASPECT_RATIOS_SDK:
+        LOGGER.warning(
+            "generate_image aspect_ratio '%s' is not supported by xai-sdk; "
+            "omitting it.",
+            aspect_ratio,
+        )
+        aspect_ratio = None
 
     image_format = "base64" if response_format == "b64_json" else "url"
     kwargs: dict[str, Any] = {
@@ -207,6 +232,15 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
     if quality is not None:
         kwargs["quality"] = quality
     return kwargs
+
+
+def _bare_base64(value: Any) -> str:
+    """Return bare base64, stripping an SDK data-URI prefix when present."""
+    text = str(value)
+    marker = "base64,"
+    if marker in text:
+        return text.split(marker, 1)[1]
+    return text
 
 
 def _safe_image_attr(item: Any, *names: str) -> Any:
@@ -249,7 +283,7 @@ def format_images_response(
         if url:
             entry["url"] = url
         if b64:
-            entry["b64_json"] = b64
+            entry["b64_json"] = _bare_base64(b64)
         if mime:
             entry["mime_type"] = mime
         if "url" not in entry and "b64_json" not in entry:
@@ -993,33 +1027,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool
 
     client = create_xai_client(api_key)
     entry.runtime_data = client
+    try:
+        tracker = UsageTracker(hass, entry.entry_id)
+        await tracker.async_load()
 
-    tracker = UsageTracker(hass, entry.entry_id)
-    await tracker.async_load()
-
-    # Probe Voice API (TTS/STT) — conversation still works if voice is denied
-    session = async_get_clientsession(hass)
-    voice_ok, voice_detail = await async_validate_voice_access(
-        session, entry.data[CONF_API_KEY]
-    )
-    if voice_ok:
-        LOGGER.info("xAI Voice API OK: %s", voice_detail)
-    else:
-        LOGGER.warning(
-            "xAI Voice API not available for this key — TTS/STT engines "
-            "may fail until voice is enabled on the key. Detail: %s",
-            voice_detail,
+        # Probe Voice API (TTS/STT) — conversation still works if voice is denied
+        session = async_get_clientsession(hass)
+        voice_ok, voice_detail = await async_validate_voice_access(
+            session, entry.data[CONF_API_KEY]
         )
+        if voice_ok:
+            LOGGER.info("xAI Voice API OK: %s", voice_detail)
+        else:
+            LOGGER.warning(
+                "xAI Voice API not available for this key — TTS/STT engines "
+                "may fail until voice is enabled on the key. Detail: %s",
+                voice_detail,
+            )
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "client": client,
-        "usage": tracker,
-        "voice_ok": voice_ok,
-        "voice_detail": voice_detail,
-    }
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+            "client": client,
+            "usage": tracker,
+            "voice_ok": voice_ok,
+            "voice_detail": voice_detail,
+        }
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    except BaseException:
+        await close_xai_client(client)
+        entry.runtime_data = None
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        raise
     return True
 
 

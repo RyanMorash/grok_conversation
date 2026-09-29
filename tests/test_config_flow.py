@@ -181,3 +181,29 @@ async def test_user_flow_cannot_connect(
     )
     assert result["type"] == FlowResultType.FORM
     assert result["errors"]["base"] == "cannot_connect"
+
+
+async def test_setup_closes_runtime_client_on_later_failure(
+    hass: HomeAssistant, mock_xai_client: MagicMock
+) -> None:
+    """gRPC client is closed if setup fails after the runtime client is created."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="xAI Grok",
+        data={CONF_API_KEY: "test-key"},
+        options=dict(RECOMMENDED_OPTIONS),
+        version=1,
+        minor_version=3,
+    )
+    entry.add_to_hass(hass)
+    mock_xai_client.close.reset_mock()
+    with patch(
+        "custom_components.grok_conversation.UsageTracker"
+    ) as tracker_cls:
+        tracker_cls.return_value.async_load = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert mock_xai_client.close.await_count >= 1
+    assert getattr(entry, "runtime_data", None) is None

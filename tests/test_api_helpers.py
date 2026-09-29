@@ -11,6 +11,7 @@ from custom_components.grok_conversation.api_helpers import (
     XAIConnectionError,
     XAIError,
     XAIRateLimitError,
+    _normalize_finish_reason,
     build_search_parameters,
     convert_messages,
     convert_response_format,
@@ -165,3 +166,11 @@ def test_map_grpc_status_codes() -> None:
     assert isinstance(
         map_xai_error(_Rpc(grpc.StatusCode.RESOURCE_EXHAUSTED)), XAIRateLimitError
     )
+
+
+def test_normalize_finish_reason_max_context() -> None:
+    """MAX_LEN and MAX_CONTEXT both map to the token-length finish reason."""
+    assert _normalize_finish_reason("REASON_MAX_LEN") == "length"
+    assert _normalize_finish_reason("REASON_MAX_CONTEXT") == "length"
+    assert _normalize_finish_reason("REASON_STOP") == "stop"
+    assert _normalize_finish_reason("REASON_TOOL_CALLS") == "stop"

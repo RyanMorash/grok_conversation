@@ -125,7 +125,10 @@ def test_build_kwargs_quality_sent_for_imagine_2_0(model: str, quality: str) -> 
         {CONF_PROMPT: "q", "quality": quality},
         model,
     )
-    assert kwargs["quality"] == quality
+    if quality == "auto":
+        assert "quality" not in kwargs
+    else:
+        assert kwargs["quality"] == quality
 
 
 @pytest.mark.parametrize(
@@ -156,7 +159,10 @@ def test_build_kwargs_quality_dropped_for_non_2_0(
     assert "quality" not in kwargs
     assert kwargs.get("aspect_ratio") == "1:1"
     assert "extra_body" not in kwargs
-    assert "only supported for grok-imagine-image-2.0" in caplog.text
+    if quality == "auto":
+        assert "only supported for grok-imagine-image-2.0" not in caplog.text
+    else:
+        assert "only supported for grok-imagine-image-2.0" in caplog.text
 
 
 def test_build_kwargs_legacy_size_style_quality(caplog: pytest.LogCaptureFixture) -> None:
@@ -211,6 +217,36 @@ def test_format_images_b64_response() -> None:
     )
     assert "url" not in result
     assert result["images"] == [{"b64_json": "abc123", "mime_type": "image/jpeg"}]
+
+
+def test_format_images_strips_data_uri_prefix() -> None:
+    """xai-sdk base64 data URIs become bare b64_json values."""
+    result = format_images_response(
+        SimpleNamespace(base64="data:image/png;base64,Zm9v", mime_type="image/png"),
+        model="grok-imagine-image",
+        response_format="b64_json",
+    )
+    assert result["images"][0]["b64_json"] == "Zm9v"
+
+
+def test_build_kwargs_omits_auto_and_maps_legacy_aspect_ratio(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """auto quality/aspect_ratio are omitted; 21:9 maps to a supported ratio."""
+    kwargs = build_image_generate_kwargs(
+        {CONF_PROMPT: "q", "quality": "auto", "aspect_ratio": "auto"},
+        "grok-imagine-image-2.0",
+    )
+    assert "quality" not in kwargs
+    assert "aspect_ratio" not in kwargs
+
+    with caplog.at_level("WARNING"):
+        kwargs = build_image_generate_kwargs(
+            {CONF_PROMPT: "q", "aspect_ratio": "21:9"},
+            "grok-imagine-image-2.0",
+        )
+    assert kwargs["aspect_ratio"] == "20:9"
+    assert "21:9" in caplog.text
 
 
 def test_format_images_empty_raises() -> None:
@@ -318,7 +354,10 @@ async def test_generate_image_b64_and_params(
     """Documented extras are first-class kwargs on 2.0; b64 has no url."""
     mock_xai_client.image.sample_batch = AsyncMock(
         return_value=[
-            SimpleNamespace(base64="Zm9v", mime_type="image/png"),
+            SimpleNamespace(
+                base64="data:image/png;base64,Zm9v",
+                mime_type="image/png",
+            ),
         ]
     )
 

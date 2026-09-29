@@ -166,8 +166,8 @@ SIZE_TO_ASPECT_RATIO = {
     "1024x1792": "9:16",
     "1792x1024": "16:9",
 }
-# Documented aspect ratios for POST /v1/images/generations
-IMAGE_ASPECT_RATIOS = (
+# Aspect ratios accepted by xai-sdk 1.19.0 (ImageAspectRatio literals).
+IMAGE_ASPECT_RATIOS_SDK = (
     "1:1",
     "3:4",
     "4:3",
@@ -181,10 +181,13 @@ IMAGE_ASPECT_RATIOS = (
     "20:9",
     "1:2",
     "2:1",
-    "21:9",
-    "5:2",
-    "auto",
 )
+# Previously valid REST values still accepted by the service schema.
+IMAGE_ASPECT_RATIO_COMPAT = {
+    "21:9": "20:9",
+    "5:2": "2:1",
+}
+IMAGE_ASPECT_RATIOS = (*IMAGE_ASPECT_RATIOS_SDK, "21:9", "5:2", "auto")
 IMAGE_RESOLUTIONS = ("1k", "2k")
 # Documented (2.0-only) + legacy DALL·E values still accepted for validation
 IMAGE_QUALITIES = ("low", "medium", "auto", "standard", "hd")

@@ -434,7 +434,11 @@ def _normalize_finish_reason(raw: Any) -> str:
     """Map xai-sdk finish reasons onto the integration's stop/length values."""
     text = str(raw or "")
     upper = text.upper()
-    if "MAX_LEN" in upper or text.lower() == "length":
+    if (
+        "MAX_LEN" in upper
+        or "MAX_CONTEXT" in upper
+        or text.lower() == "length"
+    ):
         return "length"
     return "stop"
 
