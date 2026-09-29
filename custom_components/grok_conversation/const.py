@@ -158,16 +158,8 @@ RECOMMENDED_BUDGET_WARN_USD = 0.0  # 0 = disabled
 
 UNSUPPORTED_MODELS: list[str] = []
 
-# Image generation constants (xAI Images API)
-# Deprecated size values kept for backward-compatible service validation.
-IMAGE_SIZES = ("1024x1024", "1024x1792", "1792x1024")
-SIZE_TO_ASPECT_RATIO = {
-    "1024x1024": "1:1",
-    "1024x1792": "9:16",
-    "1792x1024": "16:9",
-}
-# Aspect ratios accepted by xai-sdk 1.19.0 (ImageAspectRatio literals).
-IMAGE_ASPECT_RATIOS_SDK = (
+# Image generation constants (xai-sdk 1.19.0 ImageAspectRatio / ImageQuality).
+IMAGE_ASPECT_RATIOS = (
     "1:1",
     "3:4",
     "4:3",
@@ -182,17 +174,8 @@ IMAGE_ASPECT_RATIOS_SDK = (
     "1:2",
     "2:1",
 )
-# Previously valid REST values still accepted by the service schema.
-IMAGE_ASPECT_RATIO_COMPAT = {
-    "21:9": "20:9",
-    "5:2": "2:1",
-}
-IMAGE_ASPECT_RATIOS = (*IMAGE_ASPECT_RATIOS_SDK, "21:9", "5:2", "auto")
 IMAGE_RESOLUTIONS = ("1k", "2k")
-# Documented (2.0-only) + legacy DALL·E values still accepted for validation
-IMAGE_QUALITIES = ("low", "medium", "auto", "standard", "hd")
-IMAGE_QUALITY_DOCUMENTED = frozenset({"low", "medium", "auto"})
-IMAGE_STYLES = ("vivid", "natural")  # deprecated; accepted and ignored
+IMAGE_QUALITIES = ("low", "medium")
 IMAGE_RESPONSE_FORMATS = ("url", "b64_json")
 
 # Live search modes (xAI Responses API server tools)

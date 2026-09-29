@@ -56,15 +56,10 @@ from .const import (
     CONF_VISION_MODEL,
     DEFAULT_AI_TASK_NAME,
     DOMAIN,
-    IMAGE_ASPECT_RATIO_COMPAT,
     IMAGE_ASPECT_RATIOS,
-    IMAGE_ASPECT_RATIOS_SDK,
     IMAGE_QUALITIES,
-    IMAGE_QUALITY_DOCUMENTED,
     IMAGE_RESOLUTIONS,
     IMAGE_RESPONSE_FORMATS,
-    IMAGE_SIZES,
-    IMAGE_STYLES,
     LIVE_SEARCH_OFF,
     LOGGER,
     RECOMMENDED_AI_TASK_OPTIONS,
@@ -86,7 +81,6 @@ from .const import (
     SERVICE_PHOTO_ANALYSIS,
     SERVICE_QUERY_IMAGE,
     SERVICE_RESET_STATS,
-    SIZE_TO_ASPECT_RATIO,
     remap_retired_chat_model,
 )
 from .entity import resolve_vision_model
@@ -105,18 +99,8 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 GrokConfigEntry = ConfigEntry  # runtime_data: xai_sdk.AsyncClient
 OpenAIConfigEntry = GrokConfigEntry  # backward-compatible alias
 
-# One deprecation WARNING per field per Home Assistant run.
-_DEPRECATED_FIELD_WARNED: set[str] = set()
 _RETIRED_VISION_WARNED = False
 _QUALITY_UNSUPPORTED_WARNED = False
-
-
-def _warn_deprecated_image_field(field: str, message: str) -> None:
-    """Log a one-shot deprecation warning for a generate_image field."""
-    if field in _DEPRECATED_FIELD_WARNED:
-        return
-    _DEPRECATED_FIELD_WARNED.add(field)
-    LOGGER.warning(message)
 
 
 def model_supports_image_quality(model: str | None) -> bool:
@@ -136,58 +120,16 @@ def model_supports_image_quality(model: str | None) -> bool:
 def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[str, Any]:
     """Build kwargs for client.image.sample / sample_batch from service call data.
 
-    Never sends ``size`` or ``style``. Sends ``quality`` ``low``/``medium``
-    only when the model supports it (``grok-imagine-image-2.0``); omits
-    ``auto`` so the SDK default applies. Maps service ``response_format``
-    ``url|b64_json`` to SDK ``image_format`` ``url|base64``.
+    Maps service ``response_format`` ``url|b64_json`` to SDK ``image_format``
+    ``url|base64``. Sends ``quality`` only for ``grok-imagine-image-2.0``.
     """
     global _QUALITY_UNSUPPORTED_WARNED
 
     aspect_ratio = call_data.get("aspect_ratio")
-    size = call_data.get("size")
-    style = call_data.get("style")
     quality = call_data.get("quality")
     resolution = call_data.get("resolution")
     n = int(call_data.get("n", 1))
     response_format = call_data.get("response_format", "url")
-
-    if style is not None:
-        _warn_deprecated_image_field(
-            "style",
-            "generate_image field 'style' is deprecated and ignored by xAI; "
-            "it will be removed in a future release.",
-        )
-
-    if size is not None:
-        mapped = SIZE_TO_ASPECT_RATIO.get(size)
-        if aspect_ratio is None and mapped:
-            aspect_ratio = mapped
-            _warn_deprecated_image_field(
-                "size",
-                "generate_image field 'size' is deprecated; mapped "
-                f"'{size}' → aspect_ratio '{mapped}'. "
-                "It will be removed in a future release.",
-            )
-        else:
-            _warn_deprecated_image_field(
-                "size",
-                "generate_image field 'size' is deprecated and ignored "
-                f"(aspect_ratio already set to '{aspect_ratio}'). "
-                "It will be removed in a future release.",
-            )
-
-    if quality is not None and quality not in IMAGE_QUALITY_DOCUMENTED:
-        _warn_deprecated_image_field(
-            "quality",
-            "generate_image field 'quality' value "
-            f"'{quality}' is deprecated and ignored (use low|medium|auto for "
-            "grok-imagine-image-2.0). It will be removed in a future release.",
-        )
-        quality = None
-
-    if quality == "auto":
-        # xai-sdk 1.19.0 only accepts low|medium; auto means "use SDK default".
-        quality = None
 
     if quality is not None and not model_supports_image_quality(model):
         if not _QUALITY_UNSUPPORTED_WARNED:
@@ -198,25 +140,6 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
                 model,
             )
         quality = None
-
-    if aspect_ratio == "auto":
-        aspect_ratio = None
-    elif aspect_ratio in IMAGE_ASPECT_RATIO_COMPAT:
-        mapped_ratio = IMAGE_ASPECT_RATIO_COMPAT[aspect_ratio]
-        LOGGER.warning(
-            "generate_image aspect_ratio '%s' is not supported by xai-sdk; "
-            "using '%s'.",
-            aspect_ratio,
-            mapped_ratio,
-        )
-        aspect_ratio = mapped_ratio
-    elif aspect_ratio is not None and aspect_ratio not in IMAGE_ASPECT_RATIOS_SDK:
-        LOGGER.warning(
-            "generate_image aspect_ratio '%s' is not supported by xai-sdk; "
-            "omitting it.",
-            aspect_ratio,
-        )
-        aspect_ratio = None
 
     image_format = "base64" if response_format == "b64_json" else "url"
     kwargs: dict[str, Any] = {
@@ -906,9 +829,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Optional("response_format", default="url"): vol.In(
                     IMAGE_RESPONSE_FORMATS
                 ),
-                # Deprecated — still validated so existing automations work
-                vol.Optional("size"): vol.In(IMAGE_SIZES),
-                vol.Optional("style"): vol.In(IMAGE_STYLES),
             }
         ),
         supports_response=SupportsResponse.ONLY,

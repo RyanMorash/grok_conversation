@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
@@ -17,7 +18,6 @@ from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.grok_conversation import (
-    _DEPRECATED_FIELD_WARNED,
     async_migrate_entry,
     build_image_generate_kwargs,
     format_images_response,
@@ -54,7 +54,6 @@ from custom_components.grok_conversation.const import (
 @pytest.fixture(autouse=True)
 def _reset_deprecation_flags() -> None:
     """Reset one-shot warning flags between tests."""
-    _DEPRECATED_FIELD_WARNED.clear()
     _RETIRED_CHAT_WARNED.clear()
     import custom_components.grok_conversation as mod
 
@@ -72,7 +71,7 @@ def _image_item(*, url=None, b64_json=None, mime_type=None, revised_prompt=None)
 
 
 def test_build_kwargs_prompt_only_sends_defaults() -> None:
-    """Prompt-only call sends n=1 + response_format=url, no size/style/quality."""
+    """Prompt-only call sends n=1 and url format, no optional extras."""
     kwargs = build_image_generate_kwargs({CONF_PROMPT: "a cat"}, "grok-imagine-image")
     assert kwargs == {
         "model": "grok-imagine-image",
@@ -80,10 +79,9 @@ def test_build_kwargs_prompt_only_sends_defaults() -> None:
         "n": 1,
         "image_format": "url",
     }
-    assert "extra_body" not in kwargs
-    assert "size" not in kwargs
-    assert "style" not in kwargs
     assert "quality" not in kwargs
+    assert "aspect_ratio" not in kwargs
+    assert "resolution" not in kwargs
 
 
 def test_build_kwargs_forwards_documented_params() -> None:
@@ -117,7 +115,7 @@ def test_build_kwargs_forwards_documented_params() -> None:
         "grok-imagine-image-2.0-20260301",
     ],
 )
-@pytest.mark.parametrize("quality", ["low", "medium", "auto"])
+@pytest.mark.parametrize("quality", ["low", "medium"])
 def test_build_kwargs_quality_sent_for_imagine_2_0(model: str, quality: str) -> None:
     """Documented quality is forwarded only for grok-imagine-image-2.0 aliases."""
     assert model_supports_image_quality(model)
@@ -125,10 +123,7 @@ def test_build_kwargs_quality_sent_for_imagine_2_0(model: str, quality: str) -> 
         {CONF_PROMPT: "q", "quality": quality},
         model,
     )
-    if quality == "auto":
-        assert "quality" not in kwargs
-    else:
-        assert kwargs["quality"] == quality
+    assert kwargs["quality"] == quality
 
 
 @pytest.mark.parametrize(
@@ -141,7 +136,7 @@ def test_build_kwargs_quality_sent_for_imagine_2_0(model: str, quality: str) -> 
         RECOMMENDED_IMAGE_GENERATION_MODEL,
     ],
 )
-@pytest.mark.parametrize("quality", ["low", "medium", "auto"])
+@pytest.mark.parametrize("quality", ["low", "medium"])
 def test_build_kwargs_quality_dropped_for_non_2_0(
     model: str, quality: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -158,33 +153,7 @@ def test_build_kwargs_quality_dropped_for_non_2_0(
         )
     assert "quality" not in kwargs
     assert kwargs.get("aspect_ratio") == "1:1"
-    assert "extra_body" not in kwargs
-    if quality == "auto":
-        assert "only supported for grok-imagine-image-2.0" not in caplog.text
-    else:
-        assert "only supported for grok-imagine-image-2.0" in caplog.text
-
-
-def test_build_kwargs_legacy_size_style_quality(caplog: pytest.LogCaptureFixture) -> None:
-    """Legacy size/style/quality validate; only mapped aspect_ratio is sent."""
-    with caplog.at_level("WARNING"):
-        kwargs = build_image_generate_kwargs(
-            {
-                CONF_PROMPT: "sunset",
-                "size": "1792x1024",
-                "style": "natural",
-                "quality": "hd",
-            },
-            "grok-imagine-image",
-        )
-    assert kwargs["aspect_ratio"] == "16:9"
-    assert "quality" not in kwargs
-    assert "size" not in kwargs
-    assert "style" not in kwargs
-    text = caplog.text
-    assert "size" in text and "deprecated" in text
-    assert "style" in text and "deprecated" in text
-    assert "quality" in text and "deprecated" in text
+    assert "only supported for grok-imagine-image-2.0" in caplog.text
 
 
 def test_format_images_url_response() -> None:
@@ -227,26 +196,6 @@ def test_format_images_strips_data_uri_prefix() -> None:
         response_format="b64_json",
     )
     assert result["images"][0]["b64_json"] == "Zm9v"
-
-
-def test_build_kwargs_omits_auto_and_maps_legacy_aspect_ratio(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """auto quality/aspect_ratio are omitted; 21:9 maps to a supported ratio."""
-    kwargs = build_image_generate_kwargs(
-        {CONF_PROMPT: "q", "quality": "auto", "aspect_ratio": "auto"},
-        "grok-imagine-image-2.0",
-    )
-    assert "quality" not in kwargs
-    assert "aspect_ratio" not in kwargs
-
-    with caplog.at_level("WARNING"):
-        kwargs = build_image_generate_kwargs(
-            {CONF_PROMPT: "q", "aspect_ratio": "21:9"},
-            "grok-imagine-image-2.0",
-        )
-    assert kwargs["aspect_ratio"] == "20:9"
-    assert "21:9" in caplog.text
 
 
 def test_format_images_empty_raises() -> None:
@@ -338,12 +287,34 @@ async def test_generate_image_service_call(
     assert kwargs["prompt"] == "a lighthouse"
     assert "n" not in kwargs
     assert kwargs["image_format"] == "url"
-    assert "size" not in kwargs
-    assert "style" not in kwargs
     assert "quality" not in kwargs
-    assert "extra_body" not in kwargs
     assert response["url"] == "https://cdn.example/img.png"
     assert response["images"][0]["url"] == "https://cdn.example/img.png"
+
+
+async def test_generate_image_rejects_unsupported_schema_values(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Service schema matches xai-sdk: no auto/21:9/size/style."""
+    base = {
+        "config_entry": mock_config_entry.entry_id,
+        CONF_PROMPT: "nope",
+    }
+    for extra in (
+        {"quality": "auto"},
+        {"aspect_ratio": "21:9"},
+        {"size": "1024x1024"},
+        {"style": "vivid"},
+    ):
+        with pytest.raises(vol.Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_GENERATE_IMAGE,
+                {**base, **extra},
+                blocking=True,
+                return_response=True,
+            )
 
 
 async def test_generate_image_b64_and_params(
@@ -385,7 +356,6 @@ async def test_generate_image_b64_and_params(
     assert kwargs["aspect_ratio"] == "9:16"
     assert kwargs["resolution"] == "2k"
     assert kwargs["quality"] == "medium"
-    assert "extra_body" not in kwargs
     assert "url" not in response
     assert response["images"][0]["b64_json"] == "Zm9v"
 
