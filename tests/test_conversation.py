@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 import voluptuous as vol
 from homeassistant.components import conversation
 from homeassistant.components.conversation.chat_log import ChatLog
 from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from xai_sdk.proto import chat_pb2
@@ -196,6 +198,47 @@ async def test_conversation_fallback_model_on_primary_error(
         and c.content == "Fallback answered."
         for c in chat_log.content
     )
+
+
+async def test_rate_limit_does_not_use_fallback(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """RESOURCE_EXHAUSTED / rate-limit errors skip fallback and fail closed."""
+    grpc = pytest.importorskip("grpc")
+
+    class _Rpc(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.RESOURCE_EXHAUSTED
+
+        def details(self):
+            return "quota"
+
+    entity = _conversation_entity(hass, mock_config_entry)
+    _set_sample(mock_xai_client, _Rpc())
+
+    chat_log = ChatLog(hass=hass, conversation_id="conv-rate-limit")
+    chat_log.async_add_user_content(conversation.UserContent(content="Hi"))
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ]
+    with pytest.raises(HomeAssistantError, match="Rate limited or insufficient funds"):
+        await entity._async_handle_chat_log(  # noqa: SLF001
+            chat_log,
+            model="grok-4.3-latest",
+            options={
+                CONF_CHAT_MODEL: "grok-4.3-latest",
+                CONF_FALLBACK_MODEL: "grok-4.6",
+            },
+            messages=messages,
+            agent_id=entity.entity_id,
+            service="conversation",
+            fallback_model="grok-4.6",
+        )
+
+    assert mock_xai_client.chat.create.call_count == 1
 
 
 async def test_conversation_fallback_does_not_inherit_partial_tools(

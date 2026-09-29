@@ -739,6 +739,10 @@ async def test_options_flow_rejects_retired_fast_and_vision(
             "custom_components.grok_conversation.config_flow.create_xai_client",
             return_value=mock_xai_client,
         ),
+        patch(
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
+        ),
     ):
         result = await hass.config_entries.options.async_init(
             mock_config_entry.entry_id
@@ -790,6 +794,7 @@ async def test_options_flow_rejects_retired_fast_and_vision(
         assert result["data"][CONF_VISION_MODEL] == "grok-4.6"
         assert result["data"][CONF_FAST_MODEL] == RECOMMENDED_FAST_MODEL
         assert result["data"][CONF_FALLBACK_MODEL] == RECOMMENDED_FALLBACK_MODEL
+        await hass.async_block_till_done()
 
 
 @contextmanager

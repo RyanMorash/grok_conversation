@@ -48,6 +48,30 @@ def mock_xai_client():
     return client
 
 
+@pytest.fixture(autouse=True)
+def patch_xai_client(mock_xai_client: MagicMock):
+    """Keep the gRPC factory mocked for setup, options reload, and teardown."""
+    with (
+        patch(
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.config_flow.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.api_helpers.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.async_validate_voice_access",
+            return_value=(True, "ok"),
+        ),
+    ):
+        yield mock_xai_client
+
+
 @pytest.fixture
 def mock_openai_client(mock_xai_client):
     """Backward-compatible alias used by older test names."""
@@ -77,23 +101,7 @@ async def mock_config_entry(
         ],
     )
     entry.add_to_hass(hass)
-
-    with (
-        patch(
-            "custom_components.grok_conversation.create_xai_client",
-            return_value=mock_xai_client,
-        ),
-        patch(
-            "custom_components.grok_conversation.config_flow.create_xai_client",
-            return_value=mock_xai_client,
-        ),
-        patch(
-            "custom_components.grok_conversation.async_validate_voice_access",
-            return_value=(True, "ok"),
-        ),
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
     entry.runtime_data = mock_xai_client
     return entry

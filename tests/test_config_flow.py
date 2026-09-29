@@ -11,6 +11,10 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.grok_conversation.api_helpers import (
+    XAIAuthError,
+    XAIConnectionError,
+)
 from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
 from custom_components.grok_conversation.const import (
     CONF_CHAT_MODEL,
@@ -143,3 +147,37 @@ async def test_ai_task_subentry_create_and_reconfigure(
     assert result["type"] in (FlowResultType.ABORT, FlowResultType.CREATE_ENTRY)
     updated = mock_config_entry.subentries[subentry.subentry_id]
     assert updated.data[CONF_CHAT_MODEL] == "grok-4.5"
+
+
+async def test_user_flow_invalid_auth(
+    hass: HomeAssistant, mock_xai_client: MagicMock
+) -> None:
+    """UNAUTHENTICATED gRPC errors become invalid_auth."""
+    mock_xai_client.models.list_language_models = AsyncMock(
+        side_effect=XAIAuthError("bad key")
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_KEY: "sk-bad"}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "invalid_auth"
+
+
+async def test_user_flow_cannot_connect(
+    hass: HomeAssistant, mock_xai_client: MagicMock
+) -> None:
+    """UNAVAILABLE gRPC errors become cannot_connect."""
+    mock_xai_client.models.list_language_models = AsyncMock(
+        side_effect=XAIConnectionError("down")
+    )
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_KEY: "sk-test"}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "cannot_connect"
