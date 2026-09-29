@@ -73,7 +73,7 @@ class ParseArgumentsFailed(HomeAssistantError):
 
 
 class TokenLengthExceededError(HomeAssistantError):
-    """When openai return 'length' as 'finish_reason'."""
+    """When the model returns 'length' as finish_reason."""
 
     def __init__(self, token: int) -> None:
         """Initialize error."""

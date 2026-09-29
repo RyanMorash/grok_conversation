@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from datetime import timedelta
-from functools import partial
 import logging
 import os
 import re
@@ -10,7 +9,6 @@ from typing import Any
 from urllib import parse
 
 from bs4 import BeautifulSoup
-from openai import AsyncAzureOpenAI, AsyncOpenAI
 import voluptuous as vol
 import yaml
 
@@ -40,7 +38,6 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.script import Script
 from homeassistant.helpers.template import Template
 import homeassistant.util.dt as dt_util
@@ -137,23 +134,13 @@ async def validate_authentication(
     if skip_authentication:
         return
 
-    if is_azure(base_url):
-        client = AsyncAzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=base_url,
-            api_version=api_version,
-            organization=organization,
-            http_client=get_async_client(hass),
-        )
-    else:
-        client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            organization=organization,
-            http_client=get_async_client(hass),
-        )
+    from .api_helpers import close_xai_client, create_xai_client
 
-    await hass.async_add_executor_job(partial(client.models.list, timeout=10))
+    client = create_xai_client(api_key, timeout=10)
+    try:
+        await client.models.list_language_models()
+    finally:
+        await close_xai_client(client)
 
 
 class FunctionExecutor(ABC):

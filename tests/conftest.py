@@ -32,25 +32,56 @@ async def setup_ha(hass: HomeAssistant) -> None:
 
 
 @pytest.fixture
-def mock_openai_client():
-    """Mock openai.AsyncOpenAI used by the integration."""
+def mock_xai_client():
+    """Mock xai_sdk.AsyncClient used by the integration."""
     client = MagicMock()
-    client.platform_headers = MagicMock(return_value={})
-    client.with_options.return_value.models.list = MagicMock(
-        return_value=MagicMock(data=[MagicMock(id="grok-4.3-latest")])
-    )
-    client.models.list = AsyncMock(
-        return_value=MagicMock(data=[MagicMock(id="grok-4.3-latest")])
-    )
-    client.chat.completions.create = AsyncMock()
-    client.responses.create = AsyncMock()
+    client.close = AsyncMock()
+    language_model = MagicMock()
+    language_model.name = "grok-4.3-latest"
+    language_model.aliases = []
+    client.models.list_language_models = AsyncMock(return_value=[language_model])
+    chat = MagicMock()
+    chat.sample = AsyncMock()
+    client.chat.create = MagicMock(return_value=chat)
+    client.image.sample = AsyncMock()
+    client.image.sample_batch = AsyncMock()
     return client
+
+
+@pytest.fixture(autouse=True)
+def patch_xai_client(mock_xai_client: MagicMock):
+    """Keep the gRPC factory mocked for setup, options reload, and teardown."""
+    with (
+        patch(
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.config_flow.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.api_helpers.create_xai_client",
+            return_value=mock_xai_client,
+        ),
+        patch(
+            "custom_components.grok_conversation.async_validate_voice_access",
+            return_value=(True, "ok"),
+        ),
+    ):
+        yield mock_xai_client
+
+
+@pytest.fixture
+def mock_openai_client(mock_xai_client):
+    """Backward-compatible alias used by older test names."""
+    return mock_xai_client
 
 
 @pytest.fixture
 async def mock_config_entry(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> MockConfigEntry:
     """Create a loaded config entry with default AI Task subentry."""
     entry = MockConfigEntry(
@@ -70,31 +101,7 @@ async def mock_config_entry(
         ],
     )
     entry.add_to_hass(hass)
-
-    with (
-        patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
-        ),
-        patch(
-            "custom_components.grok_conversation.config_flow.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
-        ),
-        patch(
-            "custom_components.grok_conversation.async_validate_voice_access",
-            return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
-        ),
-        patch(
-            "custom_components.grok_conversation.config_flow.get_async_client",
-            return_value=None,
-        ),
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-
-    entry.runtime_data = mock_openai_client
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    entry.runtime_data = mock_xai_client
     return entry

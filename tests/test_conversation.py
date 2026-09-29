@@ -5,14 +5,17 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import openai
+import pytest
 import voluptuous as vol
 from homeassistant.components import conversation
 from homeassistant.components.conversation.chat_log import ChatLog
 from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from xai_sdk.proto import chat_pb2
 
+from custom_components.grok_conversation.api_helpers import XAIError
 from custom_components.grok_conversation.const import (
     CONF_CHAT_MODEL,
     CONF_FALLBACK_MODEL,
@@ -20,20 +23,15 @@ from custom_components.grok_conversation.const import (
 )
 
 
-def _completion_response(text: str = "", *, tool_calls=None, model: str | None = None):
-    """Build a minimal chat.completions-like response."""
-    message = MagicMock()
-    message.content = text
-    message.tool_calls = tool_calls
-    choice = MagicMock()
-    choice.message = message
-    choice.finish_reason = "stop"
-    usage = MagicMock()
-    usage.prompt_tokens = 11
-    usage.completion_tokens = 7
+def _chat_response(text: str = "", *, tool_calls=None, model: str | None = None):
+    """Build a minimal xai-sdk chat.sample-like response."""
     result = MagicMock()
-    result.choices = [choice]
-    result.usage = usage
+    result.content = text
+    result.tool_calls = tool_calls or []
+    result.finish_reason = "REASON_STOP"
+    result.usage.prompt_tokens = 11
+    result.usage.completion_tokens = 7
+    result.citations = []
     result.model = model
     return result
 
@@ -41,11 +39,22 @@ def _completion_response(text: str = "", *, tool_calls=None, model: str | None =
 def _tool_call(name: str, arguments: str, call_id: str = "call_1"):
     tc = MagicMock()
     tc.id = call_id
-    tc.type = "function"
     tc.function = MagicMock()
     tc.function.name = name
     tc.function.arguments = arguments
     return tc
+
+
+def _message_role(msg) -> str:
+    return chat_pb2.MessageRole.Name(msg.role).removeprefix("ROLE_").lower()
+
+
+def _message_text(msg) -> str:
+    return "".join(part.text for part in msg.content)
+
+
+def _set_sample(client: MagicMock, side_effect) -> None:
+    client.chat.create.return_value.sample = AsyncMock(side_effect=side_effect)
 
 
 class _RecordingTool(llm.Tool):
@@ -96,19 +105,20 @@ def _conversation_entity(hass: HomeAssistant, entry: MockConfigEntry):
 async def test_conversation_tool_loop_executes_tool(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Tool calls from the model execute through the shared chat-log loop."""
     tool = _RecordingTool()
     entity = _conversation_entity(hass, mock_config_entry)
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        side_effect=[
-            _completion_response(
+    _set_sample(
+        mock_xai_client,
+        [
+            _chat_response(
                 tool_calls=[_tool_call("test_light", '{"action":"turn_on"}')]
             ),
-            _completion_response("The light is on."),
-        ]
+            _chat_response("The light is on."),
+        ],
     )
 
     chat_log = ChatLog(hass=hass, conversation_id="conv-tools")
@@ -135,7 +145,7 @@ async def test_conversation_tool_loop_executes_tool(
     )
 
     assert tool.calls == [{"action": "turn_on"}]
-    assert mock_openai_client.chat.completions.create.await_count == 2
+    assert mock_xai_client.chat.create.call_count == 2
     assert any(
         isinstance(c, conversation.AssistantContent) and c.content == "The light is on."
         for c in chat_log.content
@@ -145,20 +155,17 @@ async def test_conversation_tool_loop_executes_tool(
 async def test_conversation_fallback_model_on_primary_error(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
-    """Primary OpenAIError falls through to the fallback model."""
+    """Primary XAIError falls through to the fallback model."""
     entity = _conversation_entity(hass, mock_config_entry)
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        side_effect=[
-            openai.APIError(
-                message="primary down",
-                request=MagicMock(),
-                body=None,
-            ),
-            _completion_response("Fallback answered."),
-        ]
+    _set_sample(
+        mock_xai_client,
+        [
+            XAIError("primary down"),
+            _chat_response("Fallback answered."),
+        ],
     )
 
     chat_log = ChatLog(hass=hass, conversation_id="conv-fallback")
@@ -181,9 +188,9 @@ async def test_conversation_fallback_model_on_primary_error(
         fallback_model="grok-4.6",
     )
 
-    assert mock_openai_client.chat.completions.create.await_count == 2
-    first_kwargs = mock_openai_client.chat.completions.create.await_args_list[0].kwargs
-    second_kwargs = mock_openai_client.chat.completions.create.await_args_list[1].kwargs
+    assert mock_xai_client.chat.create.call_count == 2
+    first_kwargs = mock_xai_client.chat.create.call_args_list[0].kwargs
+    second_kwargs = mock_xai_client.chat.create.call_args_list[1].kwargs
     assert first_kwargs["model"] == "grok-4.3-latest"
     assert second_kwargs["model"] == "grok-4.6"
     assert any(
@@ -193,27 +200,65 @@ async def test_conversation_fallback_model_on_primary_error(
     )
 
 
+async def test_rate_limit_does_not_use_fallback(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """RESOURCE_EXHAUSTED / rate-limit errors skip fallback and fail closed."""
+    grpc = pytest.importorskip("grpc")
+
+    class _Rpc(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.RESOURCE_EXHAUSTED
+
+        def details(self):
+            return "quota"
+
+    entity = _conversation_entity(hass, mock_config_entry)
+    _set_sample(mock_xai_client, _Rpc())
+
+    chat_log = ChatLog(hass=hass, conversation_id="conv-rate-limit")
+    chat_log.async_add_user_content(conversation.UserContent(content="Hi"))
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ]
+    with pytest.raises(HomeAssistantError, match="Rate limited or insufficient funds"):
+        await entity._async_handle_chat_log(  # noqa: SLF001
+            chat_log,
+            model="grok-4.3-latest",
+            options={
+                CONF_CHAT_MODEL: "grok-4.3-latest",
+                CONF_FALLBACK_MODEL: "grok-4.6",
+            },
+            messages=messages,
+            agent_id=entity.entity_id,
+            service="conversation",
+            fallback_model="grok-4.6",
+        )
+
+    assert mock_xai_client.chat.create.call_count == 1
+
+
 async def test_conversation_fallback_does_not_inherit_partial_tools(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Fallback request must not include the failed model's partial tool turns."""
     tool = _RecordingTool()
     entity = _conversation_entity(hass, mock_config_entry)
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        side_effect=[
-            _completion_response(
+    _set_sample(
+        mock_xai_client,
+        [
+            _chat_response(
                 tool_calls=[_tool_call("test_light", '{"action":"turn_on"}')]
             ),
-            openai.APIError(
-                message="boom after tool",
-                request=MagicMock(),
-                body=None,
-            ),
-            _completion_response("Recovered without prior tools."),
-        ]
+            XAIError("boom after tool"),
+            _chat_response("Recovered without prior tools."),
+        ],
     )
 
     chat_log = ChatLog(hass=hass, conversation_id="conv-partial")
@@ -239,17 +284,15 @@ async def test_conversation_fallback_does_not_inherit_partial_tools(
         fallback_model="grok-4.6",
     )
 
-    # Tool ran once on the primary attempt
     assert tool.calls == [{"action": "turn_on"}]
-    # Third call is the fallback's first request — must be clean (no tool roles)
-    fallback_kwargs = mock_openai_client.chat.completions.create.await_args_list[2].kwargs
+    fallback_kwargs = mock_xai_client.chat.create.call_args_list[2].kwargs
     assert fallback_kwargs["model"] == "grok-4.6"
-    roles = [m.get("role") for m in fallback_kwargs["messages"]]
+    roles = [_message_role(m) for m in fallback_kwargs["messages"]]
     assert "tool" not in roles
     assert roles.count("assistant") == 0 or all(
-        not m.get("tool_calls")
+        not list(m.tool_calls)
         for m in fallback_kwargs["messages"]
-        if m.get("role") == "assistant"
+        if _message_role(m) == "assistant"
     )
     assert roles == ["system", "user"]
 
@@ -257,19 +300,18 @@ async def test_conversation_fallback_does_not_inherit_partial_tools(
 async def test_invalid_tool_argument_json_returns_error(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Malformed tool-argument JSON is returned as a tool error, not executed."""
     tool = _RecordingTool()
     entity = _conversation_entity(hass, mock_config_entry)
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        side_effect=[
-            _completion_response(
-                tool_calls=[_tool_call("test_light", "{not-json")]
-            ),
-            _completion_response("I could not parse that tool call."),
-        ]
+    _set_sample(
+        mock_xai_client,
+        [
+            _chat_response(tool_calls=[_tool_call("test_light", "{not-json")]),
+            _chat_response("I could not parse that tool call."),
+        ],
     )
 
     chat_log = ChatLog(hass=hass, conversation_id="conv-bad-json")
@@ -291,8 +333,7 @@ async def test_invalid_tool_argument_json_returns_error(
     )
 
     assert tool.calls == []
-    # Second request should include a tool message with the JSON error
-    second_kwargs = mock_openai_client.chat.completions.create.await_args_list[1].kwargs
-    tool_msgs = [m for m in second_kwargs["messages"] if m.get("role") == "tool"]
+    second_kwargs = mock_xai_client.chat.create.call_args_list[1].kwargs
+    tool_msgs = [m for m in second_kwargs["messages"] if _message_role(m) == "tool"]
     assert tool_msgs
-    assert "Invalid tool arguments JSON" in tool_msgs[0]["content"]
+    assert "Invalid tool arguments JSON" in _message_text(tool_msgs[0])

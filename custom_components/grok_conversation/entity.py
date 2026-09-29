@@ -7,8 +7,6 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-import openai
-from openai.types.chat import ChatCompletionMessageParam
 from voluptuous_openapi import convert
 
 from homeassistant.components import conversation
@@ -24,7 +22,12 @@ try:
 except ImportError:  # pragma: no cover - HA < 2026.8 may lack probatio
     probatio = None  # type: ignore[assignment]
 
-from .api_helpers import async_chat_completion, extract_usage
+from .api_helpers import (
+    ChatToolCall,
+    XAIError,
+    XAIRateLimitError,
+    async_chat_completion,
+)
 from .const import (
     CONF_BUDGET_WARN_USD,
     CONF_CHAT_MODEL,
@@ -319,9 +322,9 @@ def _tool_result_payload(tool_result: Any) -> str:
 
 def convert_content_to_param(
     content: conversation.Content,
-) -> list[ChatCompletionMessageParam]:
+) -> list[dict[str, Any]]:
     """Convert any native chat message for this agent to the native format."""
-    messages: list[ChatCompletionMessageParam] = []
+    messages: list[dict[str, Any]] = []
 
     if isinstance(content, conversation.ToolResultContent):
         result = getattr(content, "result", None)
@@ -638,10 +641,10 @@ class GrokBaseLLMEntity(Entity):
             }
         return messages
 
-    def _openai_tool_calls_to_ha(
-        self, tool_calls: Any
+    def _tool_calls_to_ha(
+        self, tool_calls: list[ChatToolCall] | Any
     ) -> tuple[list[llm.ToolInput], dict[str, dict[str, Any]]]:
-        """Convert OpenAI SDK tool calls to HA ToolInputs.
+        """Convert SDK tool calls to HA ToolInputs.
 
         Returns ``(tool_inputs, parse_errors)`` where ``parse_errors`` maps
         tool_call id → error payload for malformed argument JSON. Those
@@ -650,26 +653,33 @@ class GrokBaseLLMEntity(Entity):
         ha_calls: list[llm.ToolInput] = []
         parse_errors: dict[str, dict[str, Any]] = {}
         for tc in tool_calls:
-            raw_args = tc.function.arguments or "{}"
+            call_id = getattr(tc, "id", "")
+            name = getattr(tc, "name", None)
+            raw_args = getattr(tc, "arguments", None)
+            if name is None:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "") if fn is not None else ""
+                raw_args = getattr(fn, "arguments", None) if fn is not None else None
+            raw_args = raw_args or "{}"
             try:
                 args = json.loads(raw_args)
             except json.JSONDecodeError as err:
-                parse_errors[tc.id] = {
+                parse_errors[call_id] = {
                     "error": f"Invalid tool arguments JSON: {err}",
                     "raw_arguments": raw_args,
                 }
                 args = {}
             if not isinstance(args, dict):
-                parse_errors[tc.id] = {
+                parse_errors[call_id] = {
                     "error": "Invalid tool arguments JSON: expected object",
                     "raw_arguments": raw_args,
                 }
                 args = {}
             ha_calls.append(
                 llm.ToolInput(
-                    tool_name=tc.function.name,
+                    tool_name=str(name or ""),
                     tool_args=args,
-                    id=tc.id,
+                    id=call_id,
                 )
             )
         return ha_calls, parse_errors
@@ -758,12 +768,12 @@ class GrokBaseLLMEntity(Entity):
                     skip_json_strip=structure is not None,
                 )
                 return
-            except openai.RateLimitError as err:
+            except XAIRateLimitError as err:
                 last_error = err
                 LOGGER.error("Rate limited by xAI on %s: %s", try_model, err)
                 del chat_log.content[content_checkpoint:]
                 break
-            except openai.OpenAIError as err:
+            except XAIError as err:
                 last_error = err
                 LOGGER.warning(
                     "Model %s failed (%s); trying fallback if available",
@@ -782,7 +792,7 @@ class GrokBaseLLMEntity(Entity):
                 del chat_log.content[content_checkpoint:]
                 continue
 
-        if isinstance(last_error, openai.RateLimitError):
+        if isinstance(last_error, XAIRateLimitError):
             raise HomeAssistantError(
                 "Rate limited or insufficient funds"
             ) from last_error
@@ -882,36 +892,34 @@ class GrokBaseLLMEntity(Entity):
                     user=chat_log.conversation_id,
                     response_format=use_response_format,
                 )
-            except openai.OpenAIError:
+            except XAIError:
                 raise
 
-            choice = result.choices[0]
-            message = choice.message
-            p_tok, c_tok = extract_usage(result)
+            p_tok, c_tok = result.prompt_tokens, result.completion_tokens
 
-            if getattr(message, "tool_calls", None):
-                ha_tool_calls, parse_errors = self._openai_tool_calls_to_ha(
-                    message.tool_calls
+            if result.tool_calls:
+                ha_tool_calls, parse_errors = self._tool_calls_to_ha(
+                    result.tool_calls
                 )
                 assistant_content = conversation.AssistantContent(
                     agent_id=agent_id,
-                    content=message.content or "",
+                    content=result.content or "",
                     tool_calls=ha_tool_calls,
                 )
                 tool_messages: list[dict[str, Any]] = [
                     {
                         "role": "assistant",
-                        "content": message.content,
+                        "content": result.content,
                         "tool_calls": [
                             {
                                 "id": tc.id,
                                 "type": "function",
                                 "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
+                                    "name": tc.name,
+                                    "arguments": tc.arguments,
                                 },
                             }
-                            for tc in message.tool_calls
+                            for tc in result.tool_calls
                         ],
                     }
                 ]
@@ -955,7 +963,7 @@ class GrokBaseLLMEntity(Entity):
                 await self._record_usage(model, p_tok, c_tok, service=service)
                 continue
 
-            raw_text = message.content or ""
+            raw_text = result.content or ""
             full_response = (
                 raw_text if skip_json_strip else _strip_json_from_response(raw_text)
             )
@@ -971,18 +979,17 @@ class GrokBaseLLMEntity(Entity):
                         {"role": "assistant", "content": full_response}
                     )
 
-            if result.usage:
-                chat_log.async_trace(
-                    {
-                        "stats": {
-                            "input_tokens": result.usage.prompt_tokens,
-                            "output_tokens": result.usage.completion_tokens,
-                        }
+            chat_log.async_trace(
+                {
+                    "stats": {
+                        "input_tokens": result.prompt_tokens,
+                        "output_tokens": result.completion_tokens,
                     }
-                )
+                }
+            )
             await self._record_usage(model, p_tok, c_tok, service=service)
 
-            if choice.finish_reason == "length":
+            if result.finish_reason == "length":
                 raise TokenLengthExceededError(
                     options.get(CONF_MAX_TOKENS, default_max_tokens)
                 )

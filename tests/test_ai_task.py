@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,9 @@ try:
 except ImportError:  # pragma: no cover
     probatio = None
 
+from xai_sdk.proto import chat_pb2
+
+from custom_components.grok_conversation.api_helpers import XAIError
 from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
 from custom_components.grok_conversation.const import (
     DOMAIN,
@@ -43,21 +47,20 @@ def _structure_schema(fields: dict):
     return vol.Schema(fields)
 
 
-def _completion_response(text: str, *, tool_calls=None):
-    """Build a minimal chat.completions-like response."""
-    message = MagicMock()
-    message.content = text
-    message.tool_calls = tool_calls
-    choice = MagicMock()
-    choice.message = message
-    choice.finish_reason = "stop"
-    usage = MagicMock()
-    usage.prompt_tokens = 10
-    usage.completion_tokens = 5
+def _chat_response(text: str, *, tool_calls=None):
+    """Build a minimal xai-sdk chat.sample-like response."""
     result = MagicMock()
-    result.choices = [choice]
-    result.usage = usage
+    result.content = text
+    result.tool_calls = tool_calls
+    result.finish_reason = "REASON_STOP"
+    result.usage.prompt_tokens = 10
+    result.usage.completion_tokens = 5
+    result.citations = []
     return result
+
+
+def _set_sample(client: MagicMock, value) -> None:
+    client.chat.create.return_value.sample = AsyncMock(return_value=value)
 
 
 @pytest.fixture
@@ -96,7 +99,7 @@ async def test_setup_creates_ai_task_entity(
 
 
 async def test_migrate_adds_ai_task_subentry(
-    hass: HomeAssistant, mock_openai_client: MagicMock
+    hass: HomeAssistant, mock_xai_client: MagicMock
 ) -> None:
     """Migrating a v1.1 entry adds the ai_task_data subentry."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -128,16 +131,12 @@ async def test_migrate_adds_ai_task_subentry(
 
     with (
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -157,13 +156,11 @@ async def test_migrate_adds_ai_task_subentry(
 async def test_generate_data_free_text(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
 ) -> None:
     """Free-text generate_data returns a string."""
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=_completion_response("The driveway is clear.")
-    )
+    _set_sample(mock_xai_client, _chat_response("The driveway is clear."))
 
     result = await ai_task.async_generate_data(
         hass,
@@ -173,20 +170,18 @@ async def test_generate_data_free_text(
     )
 
     assert result.data == "The driveway is clear."
-    call_kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
+    call_kwargs = mock_xai_client.chat.create.call_args.kwargs
     assert "response_format" not in call_kwargs
 
 
 async def test_generate_data_structured(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
 ) -> None:
     """Structured generate_data sends json_schema response_format and returns dict."""
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=_completion_response('{"cars": 2}')
-    )
+    _set_sample(mock_xai_client, _chat_response('{"cars": 2}'))
 
     result = await ai_task.async_generate_data(
         hass,
@@ -202,11 +197,10 @@ async def test_generate_data_structured(
     )
 
     assert result.data == {"cars": 2}
-    call_kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
-    assert call_kwargs["response_format"]["type"] == "json_schema"
-    assert call_kwargs["response_format"]["json_schema"]["strict"] is True
-    assert call_kwargs["response_format"]["json_schema"]["name"] == "driveway_check"
-    schema = call_kwargs["response_format"]["json_schema"]["schema"]
+    call_kwargs = mock_xai_client.chat.create.call_args.kwargs
+    rf = call_kwargs["response_format"]
+    assert rf.format_type == chat_pb2.FORMAT_TYPE_JSON_SCHEMA
+    schema = json.loads(rf.schema)
     # Strict mode: every property (including optional) must be required;
     # optional fields are nullable.
     assert set(schema["required"]) == {"cars", "notes"}
@@ -217,15 +211,13 @@ async def test_generate_data_structured(
 async def test_generate_data_records_usage(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
 ) -> None:
     """AI Task token usage lands in UsageTracker / usage sensors."""
     from custom_components.grok_conversation.const import DOMAIN
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=_completion_response("Counted.")
-    )
+    _set_sample(mock_xai_client, _chat_response("Counted."))
 
     tracker = hass.data[DOMAIN][mock_config_entry.entry_id]["usage"]
     before = tracker.snapshot.request_count
@@ -262,13 +254,11 @@ async def test_generate_data_records_usage(
 async def test_generate_data_invalid_json(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
 ) -> None:
     """Invalid JSON raises HomeAssistantError."""
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=_completion_response("NOT JSON")
-    )
+    _set_sample(mock_xai_client, _chat_response("NOT JSON"))
 
     with pytest.raises(HomeAssistantError, match="Error with Grok structured response"):
         await ai_task.async_generate_data(
@@ -285,7 +275,7 @@ async def test_generate_data_invalid_json(
 async def test_generate_data_image_attachment(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
     tmp_path: Path,
 ) -> None:
@@ -293,9 +283,7 @@ async def test_generate_data_image_attachment(
     image_path = tmp_path / "driveway.jpg"
     image_path.write_bytes(b"fake-image-bytes")
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=_completion_response("Two cars")
-    )
+    _set_sample(mock_xai_client, _chat_response("Two cars"))
 
     with (
         patch(
@@ -321,18 +309,21 @@ async def test_generate_data_image_attachment(
         )
 
     assert result.data == "Two cars"
-    kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
+    kwargs = mock_xai_client.chat.create.call_args.kwargs
     assert kwargs["model"] == RECOMMENDED_CHAT_MODEL
     messages = kwargs["messages"]
-    user_msg = next(m for m in messages if m.get("role") == "user")
-    assert isinstance(user_msg["content"], list)
-    assert any(part.get("type") == "image_url" for part in user_msg["content"])
+    user_msg = next(
+        m
+        for m in messages
+        if chat_pb2.MessageRole.Name(m.role).removeprefix("ROLE_").lower() == "user"
+    )
+    assert any(part.HasField("image_url") for part in user_msg.content)
 
 
 async def test_generate_data_non_image_attachment(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
     tmp_path: Path,
 ) -> None:
@@ -368,18 +359,12 @@ async def test_generate_data_non_image_attachment(
 async def test_generate_data_api_error(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     ai_task_entity_id: str,
 ) -> None:
     """xAI API errors map to HomeAssistantError."""
-    import openai
-
-    mock_openai_client.chat.completions.create = AsyncMock(
-        side_effect=openai.APIError(
-            message="boom",
-            request=MagicMock(),
-            body=None,
-        )
+    mock_xai_client.chat.create.return_value.sample = AsyncMock(
+        side_effect=XAIError("boom")
     )
 
     with pytest.raises(HomeAssistantError, match="Error talking to xAI"):
