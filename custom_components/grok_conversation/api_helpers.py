@@ -1,10 +1,17 @@
-"""Shared xAI API helpers (chat completions + Responses live search)."""
+"""Shared xAI API helpers (chat + live search via xai-sdk)."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+import json
 from typing import Any
 
-import openai
+import grpc
+from grpc import aio as grpc_aio
+from xai_sdk import AsyncClient
+from xai_sdk.chat import assistant, image, system, tool, tool_result, user
+from xai_sdk.proto import chat_pb2
+from xai_sdk.search import SearchParameters, web_source, x_source
 
 from .const import (
     LIVE_SEARCH_FULL,
@@ -18,7 +25,10 @@ from .const import (
     RETIRED_MODELS,
 )
 
-# Substrings that mark non-chat models returned by GET /v1/models
+CLIENT_TIMEOUT_SECONDS = 120.0
+PROBE_TIMEOUT_SECONDS = 10.0
+
+# Substrings that mark non-chat models returned by the models API
 _NON_CHAT_MODEL_MARKERS: tuple[str, ...] = (
     "imagine",
     "image",
@@ -48,6 +58,90 @@ _FALLBACK_CHAT_MODELS: tuple[str, ...] = (
     "grok-4-latest",
     "grok-4",
 )
+
+
+class XAIError(Exception):
+    """Base error talking to the xAI API."""
+
+
+class XAIAuthError(XAIError):
+    """API key is missing, invalid, or lacks permission."""
+
+
+class XAIConnectionError(XAIError):
+    """Could not reach the xAI API (network / timeout)."""
+
+
+class XAIRateLimitError(XAIError):
+    """Rate limited or quota exhausted."""
+
+
+@dataclass(slots=True)
+class ChatToolCall:
+    """Normalized client-side tool call from a chat response."""
+
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass(slots=True)
+class ChatResult:
+    """Normalized chat sample result (SDK-agnostic)."""
+
+    content: str
+    tool_calls: list[ChatToolCall] = field(default_factory=list)
+    finish_reason: str = "stop"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    citations: list[Any] = field(default_factory=list)
+
+
+def create_xai_client(
+    api_key: str, *, timeout: float = CLIENT_TIMEOUT_SECONDS
+) -> AsyncClient:
+    """Create an async xAI gRPC client."""
+    return AsyncClient(api_key=api_key, timeout=timeout)
+
+
+async def close_xai_client(client: Any) -> None:
+    """Close a gRPC client if it exposes ``close``."""
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    result = close()
+    if hasattr(result, "__await__"):
+        await result
+
+
+def map_xai_error(err: BaseException) -> XAIError:
+    """Map a gRPC / SDK exception onto the integration's error types."""
+    if isinstance(err, XAIError):
+        return err
+    details = str(err)
+    code = None
+    if isinstance(err, (grpc.RpcError, grpc_aio.AioRpcError)):
+        try:
+            code = err.code()
+        except Exception:  # noqa: BLE001
+            code = None
+        try:
+            details = err.details() or details
+        except Exception:  # noqa: BLE001
+            pass
+        if code in (
+            grpc.StatusCode.UNAUTHENTICATED,
+            grpc.StatusCode.PERMISSION_DENIED,
+        ):
+            return XAIAuthError(details)
+        if code in (
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+        ):
+            return XAIConnectionError(details)
+        if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+            return XAIRateLimitError(details)
+    return XAIError(details)
 
 
 def is_chat_model_id(model_id: str) -> bool:
@@ -95,22 +189,30 @@ def filter_chat_model_ids(model_ids: list[str]) -> list[str]:
     return out
 
 
-async def async_list_chat_models(client: openai.AsyncClient) -> list[str]:
-    """Fetch chat-capable model ids from xAI GET /v1/models.
+def _model_ids_from_language_model(item: Any) -> list[str]:
+    """Collect name + aliases from a LanguageModel proto/object."""
+    ids: list[str] = []
+    name = getattr(item, "name", None)
+    if name:
+        ids.append(str(name))
+    aliases = getattr(item, "aliases", None) or []
+    for alias in aliases:
+        if alias:
+            ids.append(str(alias))
+    return ids
+
+
+async def async_list_chat_models(client: Any) -> list[str]:
+    """Fetch chat-capable model ids from xAI language-model listing.
 
     Filters out image/video/voice/embedding models. Falls back to a static
     known list if the API call fails so Options still works offline.
     """
     try:
-        page = await client.models.list()
+        page = await client.models.list_language_models()
         raw_ids: list[str] = []
-        data = getattr(page, "data", None) or page
-        for item in data:
-            mid = getattr(item, "id", None)
-            if mid is None and isinstance(item, dict):
-                mid = item.get("id")
-            if mid:
-                raw_ids.append(str(mid))
+        for item in page or []:
+            raw_ids.extend(_model_ids_from_language_model(item))
         models = filter_chat_model_ids(raw_ids)
         if models:
             LOGGER.debug("xAI chat models: %s", models)
@@ -122,15 +224,25 @@ async def async_list_chat_models(client: openai.AsyncClient) -> list[str]:
     return filter_chat_model_ids(list(_FALLBACK_CHAT_MODELS))
 
 
-def build_live_search_tools(live_search: str) -> list[dict[str, Any]]:
-    """Return Responses API server-side search tools for the given mode."""
+def build_search_parameters(
+    live_search: str, *, return_citations: bool = True
+) -> SearchParameters | None:
+    """Return xai-sdk SearchParameters for the given live-search mode."""
     mode = (live_search or LIVE_SEARCH_OFF).lower().strip()
-    tools: list[dict[str, Any]] = []
+    if not mode or mode == LIVE_SEARCH_OFF:
+        return None
+    sources: list[Any] = []
     if mode in (LIVE_SEARCH_WEB, LIVE_SEARCH_FULL, "web search", "on", "auto"):
-        tools.append({"type": "web_search"})
+        sources.append(web_source())
     if mode in (LIVE_SEARCH_X, LIVE_SEARCH_FULL, "x search", "on", "auto"):
-        tools.append({"type": "x_search"})
-    return tools
+        sources.append(x_source())
+    if not sources:
+        return None
+    return SearchParameters(
+        mode="on",
+        sources=sources,
+        return_citations=return_citations,
+    )
 
 
 def format_citations(citations: Any) -> str:
@@ -165,69 +277,10 @@ def format_citations(citations: Any) -> str:
     return f"\n\nSources:\n{lines}"
 
 
-def extract_responses_text(response: Any) -> str:
-    """Pull assistant text out of a Responses API payload."""
-    # Newer SDKs expose output_text
-    text = getattr(response, "output_text", None)
-    if text:
-        return str(text)
-
-    chunks: list[str] = []
-    output = getattr(response, "output", None) or []
-    for item in output:
-        item_type = getattr(item, "type", None) or (
-            item.get("type") if isinstance(item, dict) else None
-        )
-        if item_type == "message":
-            content = getattr(item, "content", None)
-            if content is None and isinstance(item, dict):
-                content = item.get("content")
-            for part in content or []:
-                ptype = getattr(part, "type", None) or (
-                    part.get("type") if isinstance(part, dict) else None
-                )
-                if ptype in ("output_text", "text"):
-                    value = getattr(part, "text", None)
-                    if value is None and isinstance(part, dict):
-                        value = part.get("text")
-                    if value:
-                        chunks.append(str(value))
-        elif item_type in ("output_text", "text"):
-            value = getattr(item, "text", None)
-            if value is None and isinstance(item, dict):
-                value = item.get("text")
-            if value:
-                chunks.append(str(value))
-    return "".join(chunks).strip()
-
-
-def extract_responses_citations(response: Any) -> list[Any]:
-    """Best-effort citation extraction from Responses API result."""
-    citations = getattr(response, "citations", None)
-    if citations:
-        return list(citations)
-    # Some payloads nest citations under output annotations
-    found: list[Any] = []
-    output = getattr(response, "output", None) or []
-    for item in output:
-        content = getattr(item, "content", None)
-        if content is None and isinstance(item, dict):
-            content = item.get("content")
-        for part in content or []:
-            anns = getattr(part, "annotations", None)
-            if anns is None and isinstance(part, dict):
-                anns = part.get("annotations")
-            for ann in anns or []:
-                url = getattr(ann, "url", None)
-                if url is None and isinstance(ann, dict):
-                    url = ann.get("url")
-                if url:
-                    found.append(url)
-    return found
-
-
 def extract_usage(response: Any) -> tuple[int, int]:
-    """Return (prompt_tokens, completion_tokens) from chat or responses result."""
+    """Return (prompt_tokens, completion_tokens) from a chat result."""
+    if isinstance(response, ChatResult):
+        return response.prompt_tokens, response.completion_tokens
     usage = getattr(response, "usage", None)
     if not usage:
         return 0, 0
@@ -240,8 +293,200 @@ def extract_usage(response: Any) -> tuple[int, int]:
     return int(prompt or 0), int(completion or 0)
 
 
+def _content_parts(content: Any) -> list[Any]:
+    """Convert OpenAI-style content to xai-sdk user/system/assistant parts."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [content] if content else []
+    if isinstance(content, list):
+        parts: list[Any] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype in (None, "text"):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+                continue
+            if itype == "image_url":
+                image_url = item.get("image_url")
+                detail = "auto"
+                url = ""
+                if isinstance(image_url, dict):
+                    url = str(image_url.get("url") or "")
+                    detail = str(image_url.get("detail") or "auto")
+                elif image_url:
+                    url = str(image_url)
+                if url:
+                    if detail not in ("auto", "low", "high"):
+                        detail = "auto"
+                    parts.append(image(url, detail=detail))
+        return parts
+    return [str(content)]
+
+
+def convert_messages(messages: list[dict[str, Any]]) -> list[Any]:
+    """Convert HA/OpenAI-shaped message dicts to xai-sdk Message protos."""
+    out: list[Any] = []
+    for msg in messages:
+        role = str(msg.get("role") or "").lower()
+        content = msg.get("content")
+        if role == "developer":
+            role = "system"
+        if role == "tool":
+            if isinstance(content, str):
+                text = content
+            elif content is None:
+                text = ""
+            else:
+                text = json.dumps(content, default=str)
+            out.append(
+                tool_result(text, tool_call_id=msg.get("tool_call_id") or None)
+            )
+            continue
+        parts = _content_parts(content)
+        if role == "system":
+            out.append(system(*parts) if parts else system(""))
+            continue
+        if role == "assistant":
+            msg_pb = assistant(*parts) if parts else assistant("")
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    call_id = str(tc.get("id") or "")
+                    name = str(fn.get("name") or "")
+                    arguments = fn.get("arguments") or "{}"
+                else:
+                    call_id = str(getattr(tc, "id", "") or "")
+                    fn_obj = getattr(tc, "function", None)
+                    name = str(getattr(fn_obj, "name", "") or "")
+                    arguments = getattr(fn_obj, "arguments", None) or "{}"
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, default=str)
+                msg_pb.tool_calls.append(
+                    chat_pb2.ToolCall(
+                        id=call_id,
+                        function=chat_pb2.FunctionCall(
+                            name=name,
+                            arguments=arguments,
+                        ),
+                    )
+                )
+            out.append(msg_pb)
+            continue
+        out.append(user(*parts) if parts else user(""))
+    return out
+
+
+def convert_tools(tools: list[dict[str, Any]] | None) -> list[Any] | None:
+    """Convert OpenAI-style function tools to xai-sdk Tool protos."""
+    if not tools:
+        return None
+    out: list[Any] = []
+    for item in tools:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        fn = item.get("function") if "function" in item else item
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name") or "")
+        if not name:
+            continue
+        params = fn.get("parameters") or {"type": "object", "properties": {}}
+        out.append(
+            tool(
+                name=name,
+                description=str(fn.get("description") or ""),
+                parameters=params,
+            )
+        )
+    return out or None
+
+
+def convert_response_format(response_format: dict[str, Any] | Any | None) -> Any | None:
+    """Convert OpenAI-style json_schema dict to xai-sdk ResponseFormat proto."""
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        return response_format
+    rtype = response_format.get("type")
+    if rtype == "json_schema":
+        schema = (response_format.get("json_schema") or {}).get("schema") or {}
+        return chat_pb2.ResponseFormat(
+            format_type=chat_pb2.FORMAT_TYPE_JSON_SCHEMA,
+            schema=json.dumps(schema),
+        )
+    if rtype == "json_object":
+        return chat_pb2.ResponseFormat(
+            format_type=chat_pb2.FORMAT_TYPE_JSON_OBJECT
+        )
+    return None
+
+
+def _normalize_finish_reason(raw: Any) -> str:
+    """Map xai-sdk finish reasons onto the integration's stop/length values."""
+    text = str(raw or "")
+    upper = text.upper()
+    if "MAX_LEN" in upper or text.lower() == "length":
+        return "length"
+    return "stop"
+
+
+def _tool_calls_from_response(response: Any) -> list[ChatToolCall]:
+    """Extract client-side function tool calls from a sample response."""
+    out: list[ChatToolCall] = []
+    for tc in getattr(response, "tool_calls", None) or []:
+        fn = getattr(tc, "function", None)
+        name = str(getattr(fn, "name", "") or "")
+        arguments = getattr(fn, "arguments", None) or "{}"
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, default=str)
+        out.append(
+            ChatToolCall(
+                id=str(getattr(tc, "id", "") or ""),
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return out
+
+
+def chat_result_from_response(response: Any) -> ChatResult:
+    """Normalize an xai-sdk chat Response into ChatResult."""
+    p_tok, c_tok = extract_usage(response)
+    content = getattr(response, "content", None)
+    citations = getattr(response, "citations", None)
+    return ChatResult(
+        content=str(content or ""),
+        tool_calls=_tool_calls_from_response(response),
+        finish_reason=_normalize_finish_reason(
+            getattr(response, "finish_reason", None)
+        ),
+        prompt_tokens=p_tok,
+        completion_tokens=c_tok,
+        citations=list(citations) if citations else [],
+    )
+
+
+def _maybe_reasoning_effort(model: str, reasoning_effort: str | None) -> str | None:
+    if (
+        reasoning_effort
+        and reasoning_effort != "none"
+        and "reasoning" in model.lower()
+    ):
+        return reasoning_effort
+    return None
+
+
 async def async_chat_completion(
-    client: openai.AsyncClient,
+    client: Any,
     *,
     model: str,
     messages: list[dict[str, Any]],
@@ -253,43 +498,50 @@ async def async_chat_completion(
     reasoning_effort: str | None = None,
     user: str | None = None,
     response_format: dict[str, Any] | None = None,
-) -> Any:
-    """Call chat.completions.create with optional reasoning_effort / response_format."""
-    args: dict[str, Any] = {
+    search_parameters: SearchParameters | None = None,
+) -> ChatResult:
+    """Sample a chat completion via xai-sdk."""
+    kwargs: dict[str, Any] = {
         "model": model,
-        "messages": messages,
-        "stream": False,
+        "messages": convert_messages(messages),
     }
     if max_tokens is not None:
-        args["max_tokens"] = max_tokens
+        kwargs["max_tokens"] = max_tokens
     if temperature is not None:
-        args["temperature"] = temperature
+        kwargs["temperature"] = temperature
     if top_p is not None:
-        args["top_p"] = top_p
+        kwargs["top_p"] = top_p
     if user:
-        args["user"] = user
-    if tools:
-        args["tools"] = tools
-        args["tool_choice"] = tool_choice or "auto"
-    if response_format is not None:
-        args["response_format"] = response_format
-    if (
-        reasoning_effort
-        and reasoning_effort != "none"
-        and "reasoning" in model.lower()
-    ):
-        args["reasoning_effort"] = reasoning_effort
+        kwargs["user"] = user
+    converted_tools = convert_tools(tools)
+    if converted_tools:
+        kwargs["tools"] = converted_tools
+        kwargs["tool_choice"] = tool_choice or "auto"
+    converted_format = convert_response_format(response_format)
+    if converted_format is not None:
+        kwargs["response_format"] = converted_format
+    effort = _maybe_reasoning_effort(model, reasoning_effort)
+    if effort:
+        kwargs["reasoning_effort"] = effort
+    if search_parameters is not None:
+        kwargs["search_parameters"] = search_parameters
     LOGGER.debug(
-        "chat.completions.create model=%s tools=%s response_format=%s",
+        "chat.create model=%s tools=%s response_format=%s search=%s",
         model,
-        bool(tools),
-        bool(response_format),
+        bool(converted_tools),
+        bool(converted_format),
+        search_parameters is not None,
     )
-    return await client.chat.completions.create(**args)
+    try:
+        chat = client.chat.create(**kwargs)
+        response = await chat.sample()
+    except Exception as err:  # noqa: BLE001
+        raise map_xai_error(err) from err
+    return chat_result_from_response(response)
 
 
 async def async_responses_completion(
-    client: openai.AsyncClient,
+    client: Any,
     *,
     model: str,
     messages: list[dict[str, Any]],
@@ -301,67 +553,60 @@ async def async_responses_completion(
     show_citations: bool = True,
     reasoning_effort: str | None = None,
 ) -> tuple[str, int, int]:
-    """Call Responses API (supports xAI live web/X search). Returns text, prompt_tok, completion_tok."""
-    tools = build_live_search_tools(live_search)
-    # Convert chat-style messages to Responses `input`
-    input_items: list[dict[str, Any]] = []
-    sys_parts: list[str] = []
+    """Run a live-search chat sample. Returns text, prompt_tok, completion_tok."""
+    search_parameters = build_search_parameters(
+        live_search, return_citations=show_citations
+    )
+    request_messages: list[dict[str, Any]] = []
     if system_prompt:
-        sys_parts.append(system_prompt)
+        request_messages.append({"role": "system", "content": system_prompt})
     for msg in messages:
         role = msg.get("role")
-        content = msg.get("content")
         if role == "system":
+            content = msg.get("content")
             if isinstance(content, str) and content:
-                sys_parts.append(content)
+                request_messages.append({"role": "system", "content": content})
             continue
         if role not in ("user", "assistant"):
             continue
-        if isinstance(content, list):
-            # multimodal
-            input_items.append({"role": role, "content": content})
-        else:
-            input_items.append({"role": role, "content": str(content or "")})
-
-    args: dict[str, Any] = {
-        "model": model,
-        "input": input_items,
-    }
-    if sys_parts:
-        args["instructions"] = "\n\n".join(sys_parts)
-    if max_tokens is not None:
-        # Responses API uses max_output_tokens
-        args["max_output_tokens"] = max_tokens
-    if temperature is not None:
-        args["temperature"] = temperature
-    if top_p is not None:
-        args["top_p"] = top_p
-    if tools:
-        args["tools"] = tools
-    if (
-        reasoning_effort
-        and reasoning_effort != "none"
-        and "reasoning" in model.lower()
-    ):
-        args["reasoning"] = {"effort": reasoning_effort}
+        request_messages.append(msg)
 
     LOGGER.debug(
-        "responses.create model=%s live_search=%s tools=%s",
+        "chat.create live_search model=%s live_search=%s",
         model,
         live_search,
-        [t.get("type") for t in tools],
     )
     try:
-        response = await client.responses.create(**args)
-    except Exception as err:  # noqa: BLE001 - surface as OpenAIError-compatible
-        LOGGER.warning("Responses API failed (%s); caller may fall back", err)
+        result = await async_chat_completion(
+            client,
+            model=model,
+            messages=request_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            reasoning_effort=reasoning_effort,
+            search_parameters=search_parameters,
+        )
+    except Exception as err:  # noqa: BLE001
+        LOGGER.warning("Live search chat failed (%s); caller may fall back", err)
         raise
 
-    text = extract_responses_text(response)
+    text = result.content
     if show_citations:
-        text = text + format_citations(extract_responses_citations(response))
-    p_tok, c_tok = extract_usage(response)
-    return text, p_tok, c_tok
+        text = text + format_citations(result.citations)
+    return text, result.prompt_tokens, result.completion_tokens
+
+
+async def async_generate_images(client: Any, **kwargs: Any) -> list[Any]:
+    """Generate images via xai-sdk image.sample / sample_batch."""
+    n = int(kwargs.pop("n", 1) or 1)
+    try:
+        if n <= 1:
+            response = await client.image.sample(**kwargs)
+            return [response]
+        return list(await client.image.sample_batch(n=n, **kwargs))
+    except Exception as err:  # noqa: BLE001
+        raise map_xai_error(err) from err
 
 
 # Also expand search heuristics for "near me" / local business

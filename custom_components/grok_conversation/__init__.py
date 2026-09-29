@@ -9,9 +9,6 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
-import openai
-from openai.types.chat import ChatCompletionMessageParam
-from openai.types.images_response import ImagesResponse
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
@@ -29,13 +26,18 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.typing import ConfigType
 
 from .api_helpers import (
+    PROBE_TIMEOUT_SECONDS,
+    XAIAuthError,
+    XAIError,
     async_chat_completion,
+    async_generate_images,
     async_responses_completion,
-    extract_usage,
+    close_xai_client,
+    create_xai_client,
+    map_xai_error,
 )
 from .const import (
     CONF_CHAT_MODEL,
@@ -98,7 +100,8 @@ PLATFORMS = (
 )
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-OpenAIConfigEntry = ConfigEntry  # runtime_data: openai.AsyncClient
+GrokConfigEntry = ConfigEntry  # runtime_data: xai_sdk.AsyncClient
+OpenAIConfigEntry = GrokConfigEntry  # backward-compatible alias
 
 # One deprecation WARNING per field per Home Assistant run.
 _DEPRECATED_FIELD_WARNED: set[str] = set()
@@ -129,11 +132,12 @@ def model_supports_image_quality(model: str | None) -> bool:
 
 
 def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[str, Any]:
-    """Build kwargs for client.images.generate from service call data.
+    """Build kwargs for client.image.sample / sample_batch from service call data.
 
     Never sends ``size`` or ``style``. Sends documented ``quality``
-    (``low``/``medium``/``auto``) via ``extra_body`` only when the model
-    supports it (``grok-imagine-image-2.0``).
+    (``low``/``medium``/``auto``) only when the model supports it
+    (``grok-imagine-image-2.0``). Maps service ``response_format``
+    ``url|b64_json`` to SDK ``image_format`` ``url|base64``.
     """
     global _QUALITY_UNSUPPORTED_WARNED
 
@@ -189,40 +193,59 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
             )
         quality = None
 
+    image_format = "base64" if response_format == "b64_json" else "url"
     kwargs: dict[str, Any] = {
         "model": model,
         "prompt": call_data[CONF_PROMPT],
         "n": n,
-        "response_format": response_format,
+        "image_format": image_format,
     }
-    extra_body: dict[str, Any] = {}
     if aspect_ratio is not None:
-        extra_body["aspect_ratio"] = aspect_ratio
+        kwargs["aspect_ratio"] = aspect_ratio
     if resolution is not None:
-        extra_body["resolution"] = resolution
+        kwargs["resolution"] = resolution
     if quality is not None:
-        extra_body["quality"] = quality
-    if extra_body:
-        kwargs["extra_body"] = extra_body
+        kwargs["quality"] = quality
     return kwargs
 
 
+def _safe_image_attr(item: Any, *names: str) -> Any:
+    """Read an image attribute, swallowing SDK ValueError when the field is empty."""
+    for name in names:
+        try:
+            value = getattr(item, name, None)
+        except (ValueError, AttributeError):
+            value = None
+        if value:
+            return value
+    return None
+
+
 def format_images_response(
-    response: ImagesResponse,
+    images: Any,
     *,
     model: str,
     response_format: str,
 ) -> dict[str, Any]:
-    """Format an ImagesResponse into a backward-compatible service result."""
-    if not response.data:
+    """Format image sample results into a backward-compatible service result."""
+    if images is None:
+        raise HomeAssistantError("Image generation returned empty data")
+    data = getattr(images, "data", None)
+    if data is not None:
+        items = list(data)
+    elif isinstance(images, (list, tuple)):
+        items = list(images)
+    else:
+        items = [images]
+    if not items:
         raise HomeAssistantError("Image generation returned empty data")
 
-    images: list[dict[str, Any]] = []
-    for item in response.data:
+    formatted: list[dict[str, Any]] = []
+    for item in items:
         entry: dict[str, Any] = {}
-        url = getattr(item, "url", None)
-        b64 = getattr(item, "b64_json", None)
-        mime = getattr(item, "mime_type", None)
+        url = _safe_image_attr(item, "url")
+        b64 = _safe_image_attr(item, "base64", "b64_json")
+        mime = _safe_image_attr(item, "mime_type")
         if url:
             entry["url"] = url
         if b64:
@@ -233,12 +256,12 @@ def format_images_response(
             raise HomeAssistantError(
                 "Image generation response missing url and b64_json"
             )
-        images.append(entry)
+        formatted.append(entry)
 
-    result: dict[str, Any] = {"model": model, "images": images}
-    if response_format == "url" and images[0].get("url"):
-        result["url"] = images[0]["url"]
-    revised = getattr(response.data[0], "revised_prompt", None)
+    result: dict[str, Any] = {"model": model, "images": formatted}
+    if response_format == "url" and formatted[0].get("url"):
+        result["url"] = formatted[0]["url"]
+    revised = _safe_image_attr(items[0], "revised_prompt", "prompt")
     if revised:
         result["revised_prompt"] = revised
     return result
@@ -288,7 +311,7 @@ def encode_file(file_path: str) -> tuple[str, str]:
         raise HomeAssistantError(f"Error reading file {file_path}: {err}") from err
 
 
-def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> OpenAIConfigEntry:
+def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> GrokConfigEntry:
     """Validate and return config entry."""
     entry = hass.config_entries.async_get_entry(entry_id)
     if entry is None or entry.domain != DOMAIN:
@@ -300,7 +323,7 @@ def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> OpenAIConfigEn
     return entry  # type: ignore[return-value]
 
 
-def _entry_client(entry: OpenAIConfigEntry) -> openai.AsyncClient:
+def _entry_client(entry: GrokConfigEntry) -> Any:
     return entry.runtime_data
 
 
@@ -345,12 +368,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         kwargs = build_image_generate_kwargs(dict(call.data), model)
 
         try:
-            response: ImagesResponse = await client.images.generate(**kwargs)
-        except openai.OpenAIError as err:
+            images = await async_generate_images(client, **kwargs)
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating image: {err}") from err
 
         result = format_images_response(
-            response, model=model, response_format=response_format
+            images, model=model, response_format=response_format
         )
         await _record_usage(
             hass,
@@ -434,8 +457,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             CONF_REASONING_EFFORT, entry.options.get(CONF_REASONING_EFFORT)
         )
 
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "user", "content": content}  # type: ignore[typeddict-item]
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": content}
         ]
 
         try:
@@ -455,16 +478,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 response = await async_chat_completion(
                     client,
                     model=model,
-                    messages=messages,  # type: ignore[arg-type]
+                    messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     reasoning_effort=reasoning_effort,
                     user=call.context.user_id,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating content: {err}") from err
 
         await _record_usage(
@@ -531,9 +554,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                     top_p=top_p,
                     reasoning_effort=reasoning_effort,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error in ask service: {err}") from err
 
         await _record_usage(
@@ -617,9 +640,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 temperature=call.data.get(CONF_TEMPERATURE),
                 top_p=call.data.get(CONF_TOP_P),
             )
-            text = response.choices[0].message.content or ""
-            p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+            text = response.content
+            p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error analyzing photo: {err}") from err
 
         await _record_usage(
@@ -785,9 +808,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                     max_tokens=call.data.get(CONF_MAX_TOKENS, 500),
                     temperature=0.7,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating home briefing: {err}") from err
 
         await _record_usage(
@@ -952,25 +975,23 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool:
     """Set up Grok Conversation from a config entry."""
-    client = openai.AsyncOpenAI(
-        api_key=entry.data[CONF_API_KEY],
-        base_url="https://api.x.ai/v1",
-        http_client=get_async_client(hass),
-    )
-
-    # Cache current platform data which gets added to each request (caching done by library)
-    _ = await hass.async_add_executor_job(client.platform_headers)
-
+    api_key = entry.data[CONF_API_KEY]
+    probe = create_xai_client(api_key, timeout=PROBE_TIMEOUT_SECONDS)
     try:
-        await hass.async_add_executor_job(client.with_options(timeout=10.0).models.list)
-    except openai.AuthenticationError as err:
-        LOGGER.error("Invalid API key: %s", err)
-        return False
-    except openai.OpenAIError as err:
-        raise ConfigEntryNotReady(err) from err
+        await probe.models.list_language_models()
+    except Exception as err:  # noqa: BLE001
+        mapped = map_xai_error(err)
+        await close_xai_client(probe)
+        if isinstance(mapped, XAIAuthError):
+            LOGGER.error("Invalid API key: %s", mapped)
+            return False
+        raise ConfigEntryNotReady(mapped) from err
+    else:
+        await close_xai_client(probe)
 
+    client = create_xai_client(api_key)
     entry.runtime_data = client
 
     tracker = UsageTracker(hass, entry.entry_id)
@@ -1011,6 +1032,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Grok."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        client = getattr(entry, "runtime_data", None)
+        if client is not None:
+            await close_xai_client(client)
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unload_ok
 

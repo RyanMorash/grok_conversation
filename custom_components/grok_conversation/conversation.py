@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-import openai
-
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_LLM_HASS_API, MATCH_ALL
@@ -15,8 +13,9 @@ from homeassistant.helpers import device_registry as dr, intent, llm
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from . import OpenAIConfigEntry
+from . import GrokConfigEntry
 from .api_helpers import (
+    XAIError,
     async_responses_completion,
     looks_like_search_query,
     looks_like_simple_query,
@@ -68,7 +67,7 @@ from .entity import (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: OpenAIConfigEntry,
+    config_entry: GrokConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up conversation entities."""
@@ -86,7 +85,7 @@ class OpenAIConversationEntity(
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, entry: OpenAIConfigEntry) -> None:
+    def __init__(self, entry: GrokConfigEntry) -> None:
         """Initialize the agent."""
         GrokBaseLLMEntity.__init__(self, entry, None)
         self.entry = entry
@@ -637,7 +636,7 @@ class OpenAIConversationEntity(
             )
         except HomeAssistantError:
             raise
-        except openai.OpenAIError as err:
+        except XAIError as err:
             raise HomeAssistantError(f"Error talking to xAI: {err}") from err
 
         intent_response = intent.IntentResponse(language=user_input.language)

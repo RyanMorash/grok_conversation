@@ -6,7 +6,6 @@ from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import openai
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_API_KEY
@@ -25,6 +24,7 @@ from custom_components.grok_conversation import (
     model_supports_image_quality,
     resolve_service_vision_model,
 )
+from custom_components.grok_conversation.api_helpers import ChatResult, XAIError
 from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
 from custom_components.grok_conversation.const import (
     CONF_CHAT_MODEL,
@@ -78,7 +78,7 @@ def test_build_kwargs_prompt_only_sends_defaults() -> None:
         "model": "grok-imagine-image",
         "prompt": "a cat",
         "n": 1,
-        "response_format": "url",
+        "image_format": "url",
     }
     assert "extra_body" not in kwargs
     assert "size" not in kwargs
@@ -100,12 +100,11 @@ def test_build_kwargs_forwards_documented_params() -> None:
         "grok-imagine-image-2.0",
     )
     assert kwargs["n"] == 3
-    assert kwargs["response_format"] == "url"
-    assert kwargs["extra_body"] == {
-        "aspect_ratio": "16:9",
-        "resolution": "2k",
-        "quality": "medium",
-    }
+    assert kwargs["image_format"] == "url"
+    assert kwargs["aspect_ratio"] == "16:9"
+    assert kwargs["resolution"] == "2k"
+    assert kwargs["quality"] == "medium"
+    assert "extra_body" not in kwargs
 
 
 @pytest.mark.parametrize(
@@ -126,7 +125,7 @@ def test_build_kwargs_quality_sent_for_imagine_2_0(model: str, quality: str) -> 
         {CONF_PROMPT: "q", "quality": quality},
         model,
     )
-    assert kwargs["extra_body"]["quality"] == quality
+    assert kwargs["quality"] == quality
 
 
 @pytest.mark.parametrize(
@@ -154,8 +153,9 @@ def test_build_kwargs_quality_dropped_for_non_2_0(
             },
             model,
         )
-    assert "quality" not in kwargs.get("extra_body", {})
-    assert kwargs.get("extra_body") == {"aspect_ratio": "1:1"}
+    assert "quality" not in kwargs
+    assert kwargs.get("aspect_ratio") == "1:1"
+    assert "extra_body" not in kwargs
     assert "only supported for grok-imagine-image-2.0" in caplog.text
 
 
@@ -171,8 +171,8 @@ def test_build_kwargs_legacy_size_style_quality(caplog: pytest.LogCaptureFixture
             },
             "grok-imagine-image",
         )
-    assert kwargs["extra_body"] == {"aspect_ratio": "16:9"}
-    assert "quality" not in kwargs["extra_body"]
+    assert kwargs["aspect_ratio"] == "16:9"
+    assert "quality" not in kwargs
     assert "size" not in kwargs
     assert "style" not in kwargs
     text = caplog.text
@@ -277,13 +277,12 @@ def test_resolve_vision_model_remaps_retired(caplog: pytest.LogCaptureFixture) -
 async def test_generate_image_service_call(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
-    """Service call with prompt only hits images.generate correctly."""
-    mock_openai_client.images = MagicMock()
-    mock_openai_client.images.generate = AsyncMock(
+    """Service call with prompt only hits image.sample correctly."""
+    mock_xai_client.image.sample = AsyncMock(
         return_value=SimpleNamespace(
-            data=[_image_item(url="https://cdn.example/img.png", mime_type="image/png")]
+            url="https://cdn.example/img.png", mime_type="image/png"
         )
     )
 
@@ -298,11 +297,11 @@ async def test_generate_image_service_call(
         return_response=True,
     )
 
-    mock_openai_client.images.generate.assert_awaited_once()
-    kwargs = mock_openai_client.images.generate.await_args.kwargs
+    mock_xai_client.image.sample.assert_awaited_once()
+    kwargs = mock_xai_client.image.sample.await_args.kwargs
     assert kwargs["prompt"] == "a lighthouse"
-    assert kwargs["n"] == 1
-    assert kwargs["response_format"] == "url"
+    assert "n" not in kwargs
+    assert kwargs["image_format"] == "url"
     assert "size" not in kwargs
     assert "style" not in kwargs
     assert "quality" not in kwargs
@@ -314,14 +313,13 @@ async def test_generate_image_service_call(
 async def test_generate_image_b64_and_params(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
-    """Documented extras are forwarded via extra_body on 2.0; b64 has no url."""
-    mock_openai_client.images = MagicMock()
-    mock_openai_client.images.generate = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[_image_item(b64_json="Zm9v", mime_type="image/png")]
-        )
+    """Documented extras are first-class kwargs on 2.0; b64 has no url."""
+    mock_xai_client.image.sample_batch = AsyncMock(
+        return_value=[
+            SimpleNamespace(base64="Zm9v", mime_type="image/png"),
+        ]
     )
 
     response = await hass.services.async_call(
@@ -341,15 +339,14 @@ async def test_generate_image_b64_and_params(
         return_response=True,
     )
 
-    kwargs = mock_openai_client.images.generate.await_args.kwargs
+    kwargs = mock_xai_client.image.sample_batch.await_args.kwargs
     assert kwargs["model"] == "grok-imagine-image-2.0"
     assert kwargs["n"] == 2
-    assert kwargs["response_format"] == "b64_json"
-    assert kwargs["extra_body"] == {
-        "aspect_ratio": "9:16",
-        "resolution": "2k",
-        "quality": "medium",
-    }
+    assert kwargs["image_format"] == "base64"
+    assert kwargs["aspect_ratio"] == "9:16"
+    assert kwargs["resolution"] == "2k"
+    assert kwargs["quality"] == "medium"
+    assert "extra_body" not in kwargs
     assert "url" not in response
     assert response["images"][0]["b64_json"] == "Zm9v"
 
@@ -357,15 +354,12 @@ async def test_generate_image_b64_and_params(
 async def test_generate_image_quality_dropped_for_default_model(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Default grok-imagine-image drops quality; aspect_ratio still sent."""
-    mock_openai_client.images = MagicMock()
-    mock_openai_client.images.generate = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[_image_item(url="https://cdn.example/q.png")]
-        )
+    mock_xai_client.image.sample = AsyncMock(
+        return_value=SimpleNamespace(url="https://cdn.example/q.png")
     )
 
     with caplog.at_level("WARNING"):
@@ -382,16 +376,16 @@ async def test_generate_image_quality_dropped_for_default_model(
             return_response=True,
         )
 
-    kwargs = mock_openai_client.images.generate.await_args.kwargs
+    kwargs = mock_xai_client.image.sample.await_args.kwargs
     assert kwargs["model"] == RECOMMENDED_IMAGE_GENERATION_MODEL
-    assert kwargs["extra_body"] == {"aspect_ratio": "1:1"}
-    assert "quality" not in kwargs["extra_body"]
+    assert kwargs["aspect_ratio"] == "1:1"
+    assert "quality" not in kwargs
     assert "only supported for grok-imagine-image-2.0" in caplog.text
 
 
 async def test_generate_image_quality_uses_options_image_model(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """options[image_model]=2.0 allows quality when call omits model."""
     entry = MockConfigEntry(
@@ -417,27 +411,20 @@ async def test_generate_image_quality_uses_options_image_model(
 
     with (
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
         ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
-        ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    entry.runtime_data = mock_openai_client
+    entry.runtime_data = mock_xai_client
 
-    mock_openai_client.images = MagicMock()
-    mock_openai_client.images.generate = AsyncMock(
-        return_value=SimpleNamespace(
-            data=[_image_item(url="https://cdn.example/opt.png")]
-        )
+    mock_xai_client.image.sample = AsyncMock(
+        return_value=SimpleNamespace(url="https://cdn.example/opt.png")
     )
 
     await hass.services.async_call(
@@ -452,21 +439,18 @@ async def test_generate_image_quality_uses_options_image_model(
         return_response=True,
     )
 
-    kwargs = mock_openai_client.images.generate.await_args.kwargs
+    kwargs = mock_xai_client.image.sample.await_args.kwargs
     assert kwargs["model"] == "grok-imagine-image-2.0"
-    assert kwargs["extra_body"] == {"quality": "low"}
+    assert kwargs["quality"] == "low"
 
 
 async def test_generate_image_api_error(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
-    """OpenAIError maps to HomeAssistantError."""
-    mock_openai_client.images = MagicMock()
-    mock_openai_client.images.generate = AsyncMock(
-        side_effect=openai.OpenAIError("boom")
-    )
+    """XAIError maps to HomeAssistantError."""
+    mock_xai_client.image.sample = AsyncMock(side_effect=XAIError("boom"))
 
     with pytest.raises(HomeAssistantError, match="Error generating image"):
         await hass.services.async_call(
@@ -484,16 +468,15 @@ async def test_generate_image_api_error(
 async def test_photo_analysis_uses_vision_default(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """photo_analysis prefers the chat model when it supports images."""
     with patch(
         "custom_components.grok_conversation.async_chat_completion",
         new_callable=AsyncMock,
     ) as mock_chat:
-        mock_chat.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="a plant"))],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2),
+        mock_chat.return_value = ChatResult(
+            content="a plant", prompt_tokens=1, completion_tokens=2
         )
         response = await hass.services.async_call(
             DOMAIN,
@@ -513,7 +496,7 @@ async def test_photo_analysis_uses_vision_default(
 
 async def test_photo_analysis_uses_option_and_remaps_retired(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vision option used when chat is text-only; retired per-call override remaps."""
@@ -541,29 +524,24 @@ async def test_photo_analysis_uses_option_and_remaps_retired(
 
     with (
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
         ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
-        ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    entry.runtime_data = mock_openai_client
+    entry.runtime_data = mock_xai_client
 
     with patch(
         "custom_components.grok_conversation.async_chat_completion",
         new_callable=AsyncMock,
     ) as mock_chat:
-        mock_chat.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        mock_chat.return_value = ChatResult(
+            content="ok", prompt_tokens=1, completion_tokens=1
         )
         resp = await hass.services.async_call(
             DOMAIN,
@@ -598,7 +576,7 @@ async def test_photo_analysis_uses_option_and_remaps_retired(
 async def test_generate_content_with_image_uses_vision(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     tmp_path,
 ) -> None:
     """generate_content with an image file prefers the chat model when capable."""
@@ -616,9 +594,8 @@ async def test_generate_content_with_image_uses_vision(
             return_value=("image/jpeg", "qq"),
         ),
     ):
-        mock_chat.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="seen"))],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        mock_chat.return_value = ChatResult(
+            content="seen", prompt_tokens=1, completion_tokens=1
         )
         resp = await hass.services.async_call(
             DOMAIN,
@@ -638,7 +615,7 @@ async def test_generate_content_with_image_uses_vision(
 
 async def test_migrate_entry_rewrites_retired_vision_and_fast(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Migration to minor 3 rewrites retired vision + fast/fallback on entry + subentry."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -681,16 +658,12 @@ async def test_migrate_entry_rewrites_retired_vision_and_fast(
 
     with (
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -718,7 +691,7 @@ async def test_migrate_entry_rewrites_retired_vision_and_fast(
 
 async def test_migrate_entry_without_vision_model(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """v1.1 entry without vision_model migrates cleanly to minor 3."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -734,16 +707,12 @@ async def test_migrate_entry_without_vision_model(
 
     with (
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -758,7 +727,7 @@ async def test_migrate_entry_without_vision_model(
 async def test_options_flow_rejects_retired_fast_and_vision(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Options flow rejects retired fast/vision ids and saves current ones."""
     with (
@@ -767,12 +736,8 @@ async def test_options_flow_rejects_retired_fast_and_vision(
             return_value=[RECOMMENDED_CHAT_MODEL, RECOMMENDED_VISION_MODEL, "grok-4.6"],
         ),
         patch(
-            "custom_components.grok_conversation.config_flow.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
-        ),
-        patch(
-            "custom_components.grok_conversation.config_flow.get_async_client",
-            return_value=None,
+            "custom_components.grok_conversation.config_flow.create_xai_client",
+            return_value=mock_xai_client,
         ),
     ):
         result = await hass.config_entries.options.async_init(
@@ -828,13 +793,13 @@ async def test_options_flow_rejects_retired_fast_and_vision(
 
 
 @contextmanager
-def _setup_patches(mock_openai_client: MagicMock):
+def _setup_patches(mock_xai_client: MagicMock):
     """Common patches for config entry setup during migration tests."""
     with ExitStack() as stack:
         stack.enter_context(
             patch(
-                "custom_components.grok_conversation.openai.AsyncOpenAI",
-                return_value=mock_openai_client,
+                "custom_components.grok_conversation.create_xai_client",
+                return_value=mock_xai_client,
             )
         )
         stack.enter_context(
@@ -843,18 +808,12 @@ def _setup_patches(mock_openai_client: MagicMock):
                 return_value=(True, "ok"),
             )
         )
-        stack.enter_context(
-            patch(
-                "custom_components.grok_conversation.get_async_client",
-                return_value=None,
-            )
-        )
         yield
 
 
 async def test_migrate_minor_2_to_3_preserves_ai_task_subentry(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """1.9.0 path: minor 2 → 3 rewrites models without duplicating AI Task."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -904,7 +863,7 @@ async def test_migrate_minor_2_to_3_preserves_ai_task_subentry(
         "ai_task", DOMAIN, subentry_id_before
     )
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -928,7 +887,7 @@ async def test_migrate_minor_2_to_3_preserves_ai_task_subentry(
 
 async def test_migrate_minor_2_deleted_ai_task_stays_deleted(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """A minor-2 entry with no AI Task subentry must not get one re-added."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -947,7 +906,7 @@ async def test_migrate_minor_2_deleted_ai_task_stays_deleted(
     entry.add_to_hass(hass)
     assert not any(s.subentry_type == "ai_task_data" for s in entry.subentries.values())
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -958,7 +917,7 @@ async def test_migrate_minor_2_deleted_ai_task_stays_deleted(
 
 async def test_migrate_multiple_ai_task_subentries(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Each ai_task_data subentry with a retired chat_model is rewritten."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -997,7 +956,7 @@ async def test_migrate_multiple_ai_task_subentries(
         if s.subentry_type == "ai_task_data"
     }
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -1012,7 +971,7 @@ async def test_migrate_multiple_ai_task_subentries(
 
 async def test_migrate_entry_idempotent(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """An entry already at minor 3 is left alone; re-running changes nothing."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -1042,7 +1001,7 @@ async def test_migrate_entry_idempotent(
     options_before = dict(entry.options)
     sub_before = {sid: dict(s.data) for sid, s in entry.subentries.items()}
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -1058,7 +1017,7 @@ async def test_migrate_entry_idempotent(
 
 async def test_migrate_rejects_major_version_2(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Downgrade guard: major version 2 fails setup with MIGRATION_ERROR."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -1072,7 +1031,7 @@ async def test_migrate_rejects_major_version_2(
     )
     entry.add_to_hass(hass)
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert not await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -1082,7 +1041,7 @@ async def test_migrate_rejects_major_version_2(
 @pytest.mark.parametrize("retired_id", sorted(RETIRED_VISION_MODELS))
 async def test_migrate_each_retired_vision_id(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     retired_id: str,
 ) -> None:
     """Every retired vision model id is rewritten; unrelated options survive."""
@@ -1109,7 +1068,7 @@ async def test_migrate_each_retired_vision_id(
     )
     entry.add_to_hass(hass)
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -1130,7 +1089,7 @@ async def test_migrate_each_retired_vision_id(
 )
 async def test_migrate_each_retired_chat_id(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     retired_id: str,
     option_key: str,
     recommended: str,
@@ -1162,7 +1121,7 @@ async def test_migrate_each_retired_chat_id(
     )
     entry.add_to_hass(hass)
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -1183,7 +1142,7 @@ async def test_migrate_each_retired_chat_id(
 @pytest.mark.parametrize("retired_id", sorted(RETIRED_CHAT_MODELS))
 async def test_migrate_each_retired_chat_id_on_ai_task_subentry(
     hass: HomeAssistant,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
     retired_id: str,
 ) -> None:
     """Every retired chat model id is rewritten on ai_task_data subentries."""
@@ -1210,7 +1169,7 @@ async def test_migrate_each_retired_chat_id_on_ai_task_subentry(
     )
     entry.add_to_hass(hass)
 
-    with _setup_patches(mock_openai_client):
+    with _setup_patches(mock_xai_client):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 

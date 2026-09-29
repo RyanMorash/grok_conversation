@@ -24,7 +24,7 @@ from custom_components.grok_conversation.const import (
 
 
 async def test_user_flow_creates_ai_task_subentry(
-    hass: HomeAssistant, mock_openai_client: MagicMock
+    hass: HomeAssistant, mock_xai_client: MagicMock
 ) -> None:
     """User config flow creates an entry with a default ai_task_data subentry."""
     assert await async_setup_component(hass, "homeassistant", {})
@@ -36,16 +36,12 @@ async def test_user_flow_creates_ai_task_subentry(
             return_value={"voice_ok": True, "voice_detail": "ok"},
         ),
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         result = await hass.config_entries.flow.async_init(
@@ -68,7 +64,7 @@ async def test_user_flow_creates_ai_task_subentry(
 async def test_ai_task_subentry_create_and_reconfigure(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
-    mock_openai_client: MagicMock,
+    mock_xai_client: MagicMock,
 ) -> None:
     """Subentry flow can create and reconfigure an ai_task_data subentry."""
     with (
@@ -77,16 +73,12 @@ async def test_ai_task_subentry_create_and_reconfigure(
             return_value=[RECOMMENDED_CHAT_MODEL],
         ),
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         result = await hass.config_entries.subentries.async_init(
@@ -121,16 +113,12 @@ async def test_ai_task_subentry_create_and_reconfigure(
             return_value=[RECOMMENDED_CHAT_MODEL, "grok-4.5"],
         ),
         patch(
-            "custom_components.grok_conversation.openai.AsyncOpenAI",
-            return_value=mock_openai_client,
+            "custom_components.grok_conversation.create_xai_client",
+            return_value=mock_xai_client,
         ),
         patch(
             "custom_components.grok_conversation.async_validate_voice_access",
             return_value=(True, "ok"),
-        ),
-        patch(
-            "custom_components.grok_conversation.get_async_client",
-            return_value=None,
         ),
     ):
         result = await hass.config_entries.subentries.async_init(
