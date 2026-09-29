@@ -151,13 +151,12 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     try:
         await client.models.list_language_models()
     except Exception as err:  # noqa: BLE001
-        await close_xai_client(client)
         mapped = map_xai_error(err)
         if isinstance(mapped, (XAIAuthError, XAIConnectionError)):
             raise mapped from err
         _LOGGER.exception("Unexpected exception during validation")
         raise mapped from err
-    else:
+    finally:
         await close_xai_client(client)
 
     session = async_get_clientsession(hass)

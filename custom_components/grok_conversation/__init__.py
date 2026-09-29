@@ -166,6 +166,15 @@ def _bare_base64(value: Any) -> str:
     return text
 
 
+def _image_rejected_by_moderation(item: Any) -> bool:
+    """Return True when xai-sdk marked this image as failing moderation."""
+    try:
+        respect = getattr(item, "respect_moderation", True)
+    except (ValueError, AttributeError):
+        return False
+    return respect is False
+
+
 def _safe_image_attr(item: Any, *names: str) -> Any:
     """Read an image attribute, swallowing SDK ValueError when the field is empty."""
     for name in names:
@@ -199,6 +208,12 @@ def format_images_response(
 
     formatted: list[dict[str, Any]] = []
     for item in items:
+        # SDK url/base64 raise ValueError when respect_moderation is false;
+        # check the flag first so that is not reported as a missing payload.
+        if _image_rejected_by_moderation(item):
+            raise HomeAssistantError(
+                "Image generation rejected by content moderation"
+            )
         entry: dict[str, Any] = {}
         url = _safe_image_attr(item, "url")
         b64 = _safe_image_attr(item, "base64", "b64_json")
@@ -937,12 +952,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool
         await probe.models.list_language_models()
     except Exception as err:  # noqa: BLE001
         mapped = map_xai_error(err)
-        await close_xai_client(probe)
         if isinstance(mapped, XAIAuthError):
             LOGGER.error("Invalid API key: %s", mapped)
             return False
         raise ConfigEntryNotReady(mapped) from err
-    else:
+    finally:
         await close_xai_client(probe)
 
     client = create_xai_client(api_key)

@@ -218,6 +218,32 @@ def test_format_images_missing_payload_raises() -> None:
         )
 
 
+def test_format_images_moderation_rejection_raises() -> None:
+    """SDK respect_moderation=False is reported as moderation, not missing data."""
+
+    class _RejectedImage:
+        respect_moderation = False
+
+        @property
+        def url(self) -> str:
+            raise ValueError(
+                "Image did not respect moderation rules; URL is not available."
+            )
+
+        @property
+        def base64(self) -> str:
+            raise ValueError(
+                "Image did not respect moderation rules; base64 is not available."
+            )
+
+    with pytest.raises(HomeAssistantError, match="content moderation"):
+        format_images_response(
+            _RejectedImage(),
+            model="grok-imagine-image",
+            response_format="url",
+        )
+
+
 def test_resolve_vision_model_defaults() -> None:
     """No override → prefer chat model when it supports images (#36)."""
     assert resolve_service_vision_model(None, {}) == RECOMMENDED_CHAT_MODEL

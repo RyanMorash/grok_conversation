@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from asyncio import CancelledError
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_API_KEY, CONF_NAME
 from homeassistant.core import HomeAssistant
@@ -11,11 +13,15 @@ from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.grok_conversation import async_setup_entry
 from custom_components.grok_conversation.api_helpers import (
     XAIAuthError,
     XAIConnectionError,
 )
-from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
+from custom_components.grok_conversation.config_flow import (
+    RECOMMENDED_OPTIONS,
+    validate_input,
+)
 from custom_components.grok_conversation.const import (
     CONF_CHAT_MODEL,
     CONF_IMAGE_MODEL,
@@ -183,10 +189,20 @@ async def test_user_flow_cannot_connect(
     assert result["errors"]["base"] == "cannot_connect"
 
 
+def _grpc_client() -> MagicMock:
+    """Return a distinct mocked xAI client with awaitable close()."""
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.models.list_language_models = AsyncMock(return_value=[])
+    return client
+
+
 async def test_setup_closes_runtime_client_on_later_failure(
-    hass: HomeAssistant, mock_xai_client: MagicMock
+    hass: HomeAssistant,
 ) -> None:
-    """gRPC client is closed if setup fails after the runtime client is created."""
+    """Probe and runtime gRPC clients are both closed if later setup fails."""
+    probe = _grpc_client()
+    runtime = _grpc_client()
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="xAI Grok",
@@ -196,14 +212,55 @@ async def test_setup_closes_runtime_client_on_later_failure(
         minor_version=3,
     )
     entry.add_to_hass(hass)
-    mock_xai_client.close.reset_mock()
-    with patch(
-        "custom_components.grok_conversation.UsageTracker"
-    ) as tracker_cls:
+    with (
+        patch(
+            "custom_components.grok_conversation.create_xai_client",
+            side_effect=[probe, runtime],
+        ),
+        patch("custom_components.grok_conversation.UsageTracker") as tracker_cls,
+    ):
         tracker_cls.return_value.async_load = AsyncMock(
             side_effect=RuntimeError("boom")
         )
         assert not await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    assert mock_xai_client.close.await_count >= 1
+    assert probe.close.await_count == 1
+    assert runtime.close.await_count == 1
     assert getattr(entry, "runtime_data", None) is None
+
+
+async def test_setup_closes_probe_on_cancellation(hass: HomeAssistant) -> None:
+    """Cancelled model-list probe still closes the temporary gRPC channel."""
+    probe = _grpc_client()
+    probe.models.list_language_models = AsyncMock(side_effect=CancelledError)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="xAI Grok",
+        data={CONF_API_KEY: "test-key"},
+        options=dict(RECOMMENDED_OPTIONS),
+        version=1,
+        minor_version=3,
+    )
+    with patch(
+        "custom_components.grok_conversation.create_xai_client",
+        return_value=probe,
+    ):
+        with pytest.raises(CancelledError):
+            await async_setup_entry(hass, entry)
+    assert probe.close.await_count == 1
+    assert getattr(entry, "runtime_data", None) is None
+
+
+async def test_validate_input_closes_client_on_cancellation(
+    hass: HomeAssistant,
+) -> None:
+    """Cancelled config-flow validation still closes the probe channel."""
+    client = _grpc_client()
+    client.models.list_language_models = AsyncMock(side_effect=CancelledError)
+    with patch(
+        "custom_components.grok_conversation.config_flow.create_xai_client",
+        return_value=client,
+    ):
+        with pytest.raises(CancelledError):
+            await validate_input(hass, {CONF_API_KEY: "sk-test"})
+    assert client.close.await_count == 1
