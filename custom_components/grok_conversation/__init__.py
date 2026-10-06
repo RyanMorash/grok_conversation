@@ -103,6 +103,95 @@ OpenAIConfigEntry = GrokConfigEntry  # backward-compatible alias
 _RETIRED_VISION_WARNED = False
 _QUALITY_UNSUPPORTED_WARNED = False
 
+# Assist briefing groups, in the order they are sent. Each group is capped
+# on its own so one domain cannot fill the snapshot.
+HOME_BRIEFING_GROUP_CAP = 8
+_BRIEFING_GROUPS = ("alarm", "lock", "door", "climate", "person")
+_BRIEFING_GROUP_DOMAINS = {
+    "alarm": frozenset({"alarm", "alarm_control_panel"}),
+    "lock": frozenset({"lock"}),
+    "door": frozenset({"door", "binary_sensor", "cover"}),
+    "climate": frozenset({"climate"}),
+    "person": frozenset({"person"}),
+}
+_DOOR_BINARY_CLASSES = frozenset({"door", "garage_door"})
+_DOOR_COVER_CLASSES = frozenset({"door", "garage", "gate"})
+
+
+def _device_class_value(state: Any) -> str:
+    raw = state.attributes.get("device_class")
+    if raw is None:
+        return ""
+    return str(getattr(raw, "value", raw)).lower()
+
+
+def _briefing_group(state: Any) -> str | None:
+    """Return the briefing group for a state, if it belongs in one."""
+    domain = state.domain
+    device_class = _device_class_value(state)
+    if domain == "alarm_control_panel":
+        return "alarm"
+    if domain == "lock":
+        return "lock"
+    if domain == "climate":
+        return "climate"
+    if domain == "person":
+        return "person"
+    if domain == "binary_sensor" and device_class in _DOOR_BINARY_CLASSES:
+        return "door"
+    if domain == "cover" and device_class in _DOOR_COVER_CLASSES:
+        return "door"
+    return None
+
+
+def collect_home_briefing_lines(
+    hass: HomeAssistant,
+    *,
+    domains: set[str] | None = None,
+    include_unavailable: bool = False,
+    max_entities: int = 80,
+    per_group_cap: int = HOME_BRIEFING_GROUP_CAP,
+) -> list[str]:
+    """Build a briefing snapshot from entities exposed to Assist.
+
+    Groups are alarm, lock, door, climate, then person. Each group is capped,
+    and the whole snapshot stops at ``max_entities``.
+    """
+    from homeassistant.components.homeassistant.exposed_entities import (
+        async_should_expose,
+    )
+
+    grouped: dict[str, list[Any]] = {name: [] for name in _BRIEFING_GROUPS}
+    for state in hass.states.async_all():
+        group = _briefing_group(state)
+        if group is None:
+            continue
+        if domains is not None and not (
+            _BRIEFING_GROUP_DOMAINS[group] & domains
+        ):
+            continue
+        if not include_unavailable and state.state in ("unavailable", "unknown"):
+            continue
+        try:
+            exposed = async_should_expose(hass, "conversation", state.entity_id)
+        except KeyError:
+            exposed = False
+        if not exposed:
+            continue
+        grouped[group].append(state)
+
+    lines: list[str] = []
+    for group in _BRIEFING_GROUPS:
+        states = sorted(grouped[group], key=lambda state: state.entity_id)
+        for state in states[:per_group_cap]:
+            if len(lines) >= max_entities:
+                return lines
+            friendly = state.attributes.get("friendly_name") or state.entity_id
+            unit = state.attributes.get("unit_of_measurement")
+            value = f"{state.state}{(' ' + unit) if unit else ''}"
+            lines.append(f"- {friendly} ({state.entity_id}): {value}")
+    return lines
+
 
 def model_supports_image_quality(model: str | None) -> bool:
     """Return True if ``quality`` is documented for this imagine model.
@@ -718,28 +807,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         ]
         include_unavailable = bool(call.data.get("include_unavailable", False))
         max_entities = int(call.data.get("max_entities", 80))
-
-        lines: list[str] = []
-        count = 0
-        for state in hass.states.async_all():
-            domain = state.domain
-            if domain not in domains:
-                continue
-            if not include_unavailable and state.state in (
-                "unavailable",
-                "unknown",
-            ):
-                continue
-            # Prefer exposed-looking entities; skip noisy internals
-            if state.entity_id.startswith(("sensor.date", "sensor.time")):
-                continue
-            friendly = state.attributes.get("friendly_name") or state.entity_id
-            unit = state.attributes.get("unit_of_measurement")
-            value = f"{state.state}{(' ' + unit) if unit else ''}"
-            lines.append(f"- {friendly} ({state.entity_id}): {value}")
-            count += 1
-            if count >= max_entities:
-                break
+        lines = collect_home_briefing_lines(
+            hass,
+            domains=set(domains),
+            include_unavailable=include_unavailable,
+            max_entities=max_entities,
+        )
+        count = len(lines)
 
         location = entry.options.get(CONF_LOCATION_CONTEXT) or ""
         tz = str(hass.config.time_zone or "")
