@@ -99,7 +99,7 @@ async def async_validate_voice_access(
                 data = await resp.json(content_type=None)
             except (ClientError, ValueError, TypeError):
                 return False, "Voices list was not usable"
-    except ClientError as err:
+    except (ClientError, TimeoutError) as err:
         return False, f"Could not reach xAI Voice API: {err}"
 
     if _voices_list_usable(data):

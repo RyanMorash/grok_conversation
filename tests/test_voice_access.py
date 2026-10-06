@@ -170,6 +170,12 @@ async def test_unusable_voices_list_does_not_synthesize() -> None:
     assert detail.startswith("Could not reach")
     assert down.posts == []
 
+    timed_out = _Session(error=TimeoutError())
+    ok, detail = await async_validate_voice_access(timed_out, "sk")  # type: ignore[arg-type]
+    assert ok is False
+    assert detail.startswith("Could not reach")
+    assert timed_out.posts == []
+
 
 async def test_usable_voices_list_does_not_post() -> None:
     """A voices payload with an id is enough; no speech sample is sent."""
@@ -280,6 +286,62 @@ async def test_clear_memory_does_not_reload(
         )
     assert result["status"] == "ok"
     assert mock_config_entry.state is ConfigEntryState.LOADED
+
+
+async def test_recheck_reachability_keeps_existing_repair(hass: HomeAssistant) -> None:
+    """A recheck that cannot reach Voice does not delete the chat-only repair."""
+    probe = AsyncMock(
+        side_effect=[
+            (False, "Voices list was not usable"),
+            (False, "Could not reach xAI Voice API: down"),
+        ]
+    )
+    entry = _entry()
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.grok_conversation.async_validate_voice_access",
+        probe,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_RECHECK_VOICE,
+            {"config_entry": entry.entry_id},
+            blocking=True,
+            return_response=True,
+        )
+        await hass.async_block_till_done()
+    issue = ir.async_get(hass).async_get_issue(
+        DOMAIN, f"voice_chat_only_{entry.entry_id}"
+    )
+    assert issue is not None
+    assert entry.data[CONF_VOICE_ACCESS]["detail"].startswith("Could not reach")
+
+
+async def test_user_flow_connectivity_is_not_chat_only(hass: HomeAssistant) -> None:
+    """A Voice timeout does not ask the user to confirm a chat-only key."""
+    with patch(
+        "custom_components.grok_conversation.config_flow.async_validate_voice_access",
+        return_value=(False, "Could not reach xAI Voice API: timed out"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_API_KEY: "sk-chat"}
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    created = result["result"]
+    assert created.data[CONF_VOICE_ACCESS]["ok"] is False
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"voice_chat_only_{created.entry_id}"
+        )
+        is None
+    )
 
 
 async def test_recheck_service_clears_chat_only_issue(hass: HomeAssistant) -> None:

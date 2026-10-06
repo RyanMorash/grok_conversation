@@ -231,7 +231,14 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         except Exception:  # noqa: BLE001
             errors["base"] = "unknown"
         else:
-            if not info.get("voice_ok") and not self._voice_chat_only_seen:
+            voice_detail = str(info.get("voice_detail") or "")
+            # A timeout is not proof the key lacks Voice. Don't ask the user
+            # to confirm a chat-only key for a reachability failure.
+            if (
+                not info.get("voice_ok")
+                and not voice_detail.startswith("Could not reach")
+                and not self._voice_chat_only_seen
+            ):
                 self._voice_chat_only_seen = True
                 _LOGGER.warning(
                     "xAI key valid for chat but Voice API check failed: %s",

@@ -394,10 +394,16 @@ def _voice_access_cache(entry: ConfigEntry) -> dict[str, Any] | None:
 def async_publish_voice_repair(
     hass: HomeAssistant, entry: ConfigEntry, voice_ok: bool, detail: str
 ) -> None:
-    """Raise a repair when the key can chat but cannot use Voice."""
+    """Raise a repair when the key can chat but cannot use Voice.
+
+    A reachability failure is not a chat-only key. Leave an existing repair
+    in place until a probe says Voice works or the voices list is unusable.
+    """
     issue_id = f"voice_chat_only_{entry.entry_id}"
-    if voice_ok or detail.startswith("Could not reach"):
+    if voice_ok:
         ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+    if detail.startswith("Could not reach"):
         return
     ir.async_create_issue(
         hass,
