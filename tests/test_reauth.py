@@ -178,6 +178,51 @@ async def test_reauth_confirm_invalid_key(hass: HomeAssistant, mock_xai_client) 
     assert entry.data[CONF_API_KEY] == "sk-old"
 
 
+async def test_create_rejects_key_stored_on_legacy_entry(hass: HomeAssistant) -> None:
+    """A second add of a key matches legacy entries that have no unique id."""
+    legacy = _entry("sk-legacy")
+    legacy.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(legacy.entry_id)
+    await hass.async_block_till_done()
+    assert legacy.unique_id is None
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_KEY: "sk-legacy"}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert legacy.unique_id is None
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+
+
+async def test_reauth_rejects_key_stored_on_legacy_entry(hass: HomeAssistant) -> None:
+    """Reauth will not take a key that a unique_id-less entry already stores."""
+    legacy = _entry("sk-legacy")
+    current = _entry("sk-current", unique_id=api_key_unique_id("sk-current"))
+    legacy.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(legacy.entry_id)
+    current.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(current.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": current.entry_id},
+        data=dict(current.data),
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_KEY: "sk-legacy"}
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert current.data[CONF_API_KEY] == "sk-current"
+    assert legacy.data[CONF_API_KEY] == "sk-legacy"
+    assert legacy.unique_id is None
+
+
 async def test_reauth_does_not_take_another_entrys_key(hass: HomeAssistant) -> None:
     """Reauth aborts when the new key hash already belongs to another entry."""
     first = _entry("sk-first", unique_id=api_key_unique_id("sk-first"))

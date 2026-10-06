@@ -180,6 +180,20 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
     MINOR_VERSION = 4
 
+    def _api_key_used_by_other_entry(
+        self, api_key: str, *, exclude_entry_id: str | None = None
+    ) -> bool:
+        """Return True when another entry already stores this API key.
+
+        Legacy entries keep ``unique_id=None``, so a hash lookup misses them.
+        """
+        for entry in self._async_current_entries():
+            if exclude_entry_id and entry.entry_id == exclude_entry_id:
+                continue
+            if entry.data.get(CONF_API_KEY) == api_key:
+                return True
+        return False
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -209,6 +223,8 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                 # Still create — conversation works; TTS/STT may need key permissions
             await self.async_set_unique_id(api_key_unique_id(user_input[CONF_API_KEY]))
             self._abort_if_unique_id_configured()
+            if self._api_key_used_by_other_entry(user_input[CONF_API_KEY]):
+                return self.async_abort(reason="already_configured")
             options = dict(RECOMMENDED_OPTIONS)
             api_id = pick_default_llm_api(llm.async_get_apis(self.hass))
             if api_id:
@@ -268,6 +284,10 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                     DOMAIN, new_id
                 )
                 if existing is not None and existing.entry_id != reauth_entry.entry_id:
+                    return self.async_abort(reason="already_configured")
+                if self._api_key_used_by_other_entry(
+                    new_key, exclude_entry_id=reauth_entry.entry_id
+                ):
                     return self.async_abort(reason="already_configured")
                 return self.async_update_reload_and_abort(
                     reauth_entry,
