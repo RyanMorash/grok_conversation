@@ -295,3 +295,42 @@ async def test_stream_retries_without_rejected_reasoning_effort() -> None:
     assert "reasoning_effort" in calls[0]
     assert "reasoning_effort" not in calls[1]
     assert "grok-4.3-latest" in _REASONING_EFFORT_REJECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        XAIAuthError("reasoning_effort rejected for this key"),
+        XAIRateLimitError("rate limited while sending reasoning_effort"),
+        XAIInvalidArgumentError(
+            "invalid reasoning_effort value 'extreme'; must be one of low, medium, high"
+        ),
+    ],
+)
+async def test_other_errors_do_not_drop_reasoning_effort(error: Exception) -> None:
+    """Only an unsupported-field error permanently omits reasoning_effort."""
+    _REASONING_EFFORT_REJECTED.clear()
+    calls: list[dict] = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        chat = MagicMock()
+        chat.sample = AsyncMock(side_effect=error)
+        return chat
+
+    client = MagicMock()
+    client.chat.create = MagicMock(side_effect=create)
+    with pytest.raises(type(error)):
+        await async_chat_completion(
+            client,
+            model="grok-4.3",
+            messages=[{"role": "user", "content": "Hi"}],
+            reasoning_effort="low",
+        )
+
+    assert len(calls) == 1
+    assert "reasoning_effort" in calls[0]
+    assert "grok-4.3" not in _REASONING_EFFORT_REJECTED
+    follow_up = _kwargs_for("grok-4.3", "low")
+    assert follow_up["reasoning_effort"] == "low"

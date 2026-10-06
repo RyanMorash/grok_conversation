@@ -521,10 +521,49 @@ def _maybe_reasoning_effort(model: str, reasoning_effort: str | None) -> str | N
     return reasoning_effort
 
 
+_UNSUPPORTED_FIELD_PHRASES = (
+    "unknown field",
+    "unknown parameter",
+    "unknown argument",
+    "unrecognized field",
+    "unrecognized parameter",
+    "unexpected field",
+    "unexpected keyword",
+    "unexpected argument",
+    "not a valid field",
+    "extra field",
+    "additional property",
+    "not supported",
+    "does not support",
+    "isn't supported",
+    "unsupported field",
+    "unsupported parameter",
+)
+
+_INVALID_EFFORT_VALUE_PHRASES = (
+    "invalid value",
+    "must be one of",
+    "must be one",
+    "valid values",
+    "allowed values",
+    "enum",
+)
+
+
 def _reasoning_effort_rejected(err: BaseException) -> bool:
-    """Return True when the API refused the reasoning_effort field."""
+    """Return True only when the model does not accept the field itself.
+
+    Auth failures, rate limits, and an invalid effort value still mention the
+    parameter, but the field remains usable on the next call.
+    """
+    if not isinstance(err, XAIInvalidArgumentError):
+        return False
     text = str(err).lower().replace("_", " ")
-    return "reasoning effort" in text
+    if "reasoning effort" not in text:
+        return False
+    if any(phrase in text for phrase in _INVALID_EFFORT_VALUE_PHRASES):
+        return False
+    return any(phrase in text for phrase in _UNSUPPORTED_FIELD_PHRASES)
 
 
 def _drop_reasoning_effort(model: str) -> None:
