@@ -101,7 +101,9 @@ from .api_helpers import (
 from .voice_const import (
     CONF_ENABLE_STT,
     CONF_ENABLE_TTS,
+    CONF_RECHECK_VOICE,
     CONF_STT_LANGUAGE,
+    CONF_VOICE_ACCESS,
     CONF_TTS_LANGUAGE,
     CONF_TTS_SPEED,
     CONF_TTS_VOICE,
@@ -174,11 +176,23 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     return {"voice_ok": voice_ok, "voice_detail": voice_detail}
 
 
+def _voice_form_note(entry_data: Mapping[str, Any]) -> str:
+    """Note shown when the stored voices-list result is chat-only."""
+    cached = entry_data.get(CONF_VOICE_ACCESS)
+    if not isinstance(cached, dict) or cached.get("ok"):
+        return ""
+    detail = str(cached.get("detail") or "")
+    if detail.startswith("Could not reach"):
+        return ""
+    return " This key can chat, but xAI Voice is not available."
+
+
 class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Grok Conversation."""
 
     VERSION = 1
     MINOR_VERSION = 4
+    _voice_chat_only_seen = False
 
     def _api_key_used_by_other_entry(
         self, api_key: str, *, exclude_entry_id: str | None = None
@@ -200,11 +214,13 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle the initial step."""
         if user_input is None:
             return self.async_show_form(
-                step_id="user", data_schema=STEP_USER_DATA_SCHEMA
+                step_id="user",
+                data_schema=STEP_USER_DATA_SCHEMA,
+                description_placeholders={"voice_note": ""},
             )
 
         errors: dict[str, str] = {}
-        description_placeholders: dict[str, str] = {}
+        description_placeholders: dict[str, str] = {"voice_note": ""}
 
         try:
             info = await validate_input(self.hass, user_input)
@@ -215,12 +231,21 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         except Exception:  # noqa: BLE001
             errors["base"] = "unknown"
         else:
-            if not info.get("voice_ok"):
+            if not info.get("voice_ok") and not self._voice_chat_only_seen:
+                self._voice_chat_only_seen = True
                 _LOGGER.warning(
                     "xAI key valid for chat but Voice API check failed: %s",
                     info.get("voice_detail"),
                 )
-                # Still create — conversation works; TTS/STT may need key permissions
+                description_placeholders["voice_note"] = (
+                    " This key can chat, but xAI Voice is not available."
+                )
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_USER_DATA_SCHEMA,
+                    errors={"base": "voice_chat_only"},
+                    description_placeholders=description_placeholders,
+                )
             await self.async_set_unique_id(api_key_unique_id(user_input[CONF_API_KEY]))
             self._abort_if_unique_id_configured()
             if self._api_key_used_by_other_entry(user_input[CONF_API_KEY]):
@@ -231,7 +256,13 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                 options[CONF_LLM_HASS_API] = [api_id]
             return self.async_create_entry(
                 title="xAI Grok",
-                data=user_input,
+                data={
+                    **user_input,
+                    CONF_VOICE_ACCESS: {
+                        "ok": bool(info.get("voice_ok")),
+                        "detail": str(info.get("voice_detail") or ""),
+                    },
+                },
                 options=options,
                 subentries=[
                     {
@@ -268,7 +299,7 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                await validate_input(self.hass, user_input)
+                info = await validate_input(self.hass, user_input)
             except XAIConnectionError:
                 errors["base"] = "cannot_connect"
             except XAIAuthError:
@@ -289,9 +320,19 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                     new_key, exclude_entry_id=reauth_entry.entry_id
                 ):
                     return self.async_abort(reason="already_configured")
+                # Replace entry data so the previous voices-list cache cannot
+                # survive a key change. validate_input already probed the new key.
+                new_data = {
+                    **reauth_entry.data,
+                    CONF_API_KEY: new_key,
+                    CONF_VOICE_ACCESS: {
+                        "ok": bool(info.get("voice_ok")),
+                        "detail": str(info.get("voice_detail") or ""),
+                    },
+                }
                 return self.async_update_reload_and_abort(
                     reauth_entry,
-                    data_updates={CONF_API_KEY: new_key},
+                    data=new_data,
                     unique_id=new_id,
                 )
 
@@ -373,6 +414,8 @@ class OpenAIOptionsFlow(OptionsFlow):
         chat_models = await self._async_get_chat_models()
 
         if user_input is not None:
+            # Checkbox is an action, not a stored option.
+            recheck_voice = bool(user_input.pop(CONF_RECHECK_VOICE, False))
             if user_input[CONF_RECOMMENDED] == self.last_rendered_recommended:
                 llm_hass_api = user_input.get(CONF_LLM_HASS_API)
                 if llm_hass_api:
@@ -482,6 +525,10 @@ class OpenAIOptionsFlow(OptionsFlow):
                     errors[CONF_VISION_MODEL] = "model_not_supported"
 
                 if not errors:
+                    if recheck_voice:
+                        from . import async_recheck_voice_access
+
+                        await async_recheck_voice_access(self.hass, self.config_entry)
                     return self.async_create_entry(title="", data=user_input)
             else:
                 # Recommended checkbox toggled — re-render form, keep other values
@@ -499,6 +546,9 @@ class OpenAIOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(schema),
             errors=errors,
+            description_placeholders={
+                "voice_note": _voice_form_note(self.config_entry.data)
+            },
         )
 
 
@@ -764,6 +814,7 @@ def openai_config_option_schema(
                 mode=SelectSelectorMode.DROPDOWN,
             )
         ),
+        vol.Optional(CONF_RECHECK_VOICE, default=False): bool,
         vol.Required(
             CONF_RECOMMENDED, default=options.get(CONF_RECOMMENDED, True)
         ): bool,

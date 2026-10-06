@@ -3,14 +3,15 @@
     "error": {
       "cannot_connect": "Failed to connect",
       "invalid_auth": "Invalid authentication",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "voice_chat_only": "This key can chat, but xAI Voice is not available. Submit again to continue."
     },
     "step": {
       "user": {
         "data": {
           "api_key": "API Key"
         },
-        "description": "Enter your xAI API key from the xAI console. The same key powers Conversation, TTS, and STT (Voice API access is checked automatically)."
+        "description": "Enter your xAI API key from the xAI console. The same key powers Conversation, TTS, and STT (Voice API access is checked automatically).{voice_note}"
       },
       "reauth_confirm": {
         "title": "Reauthenticate xAI",
@@ -56,6 +57,7 @@
   "options": {
     "step": {
       "init": {
+        "description": "Adjust Grok conversation, voice, and search.{voice_note}",
         "data": {
           "prompt": "Instructions",
           "chat_model": "Primary chat model",
@@ -82,7 +84,8 @@
           "tts_voice": "Default TTS voice",
           "tts_language": "Default TTS language",
           "tts_speed": "TTS speed (0.7–1.5)",
-          "stt_language": "Default STT language"
+          "stt_language": "Default STT language",
+          "recheck_voice_access": "Check xAI Voice access again"
         },
         "data_description": {
           "vision_model": "Fallback for image services and AI Task attachments when the chat model cannot take images. An image-capable chat model always wins; this option is only used as a fallback. Default grok-4.3.",
@@ -154,7 +157,11 @@
     },
     "clear_memory": {
       "name": "Clear memory",
-      "description": "Reload integration to reset agent memory"
+      "description": "Leave the config entry loaded. Home Assistant owns chat history."
+    },
+    "recheck_voice": {
+      "name": "Recheck Voice access",
+      "description": "Probe the xAI voices list again and update the stored result."
     },
     "reset_stats": {
       "name": "Reset usage stats",
@@ -177,6 +184,25 @@
     },
     "token_length": {
       "message": "That reply was cut off. Raise the token limit and try again."
+    }
+  },
+  "issues": {
+    "voice_chat_only": {
+      "title": "xAI key cannot use Voice",
+      "description": "This API key can chat, but xAI Voice is not available. {detail}",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Recheck xAI Voice",
+            "description": "Probe the voices list again for this key."
+          }
+        },
+        "abort": {
+          "voice_ok": "xAI Voice is available for this key.",
+          "voice_still_unavailable": "xAI Voice is still unavailable for this key.",
+          "entry_missing": "The config entry for this repair is gone."
+        }
+      }
     }
   }
 }
