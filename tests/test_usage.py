@@ -18,17 +18,10 @@ from custom_components.grok_conversation.const import (
     RECOMMENDED_IMAGE_GENERATION_MODEL,
     SERVICE_GENERATE_IMAGE,
 )
-from custom_components.grok_conversation.sensor import GrokUsageSensor
 from custom_components.grok_conversation.usage import (
     imagine_estimate_usd,
     token_prices_for_model,
 )
-
-
-def test_usage_sensors_use_total_state_class() -> None:
-    """Cleared totals need TOTAL plus last_reset, not TOTAL_INCREASING."""
-    # SensorEntity wraps _attr_state_class in a cached property.
-    assert GrokUsageSensor.__dict__["_attr_state_class"] is SensorStateClass.TOTAL
 
 
 def test_model_price_table_and_imagine_estimate() -> None:
@@ -133,6 +126,10 @@ async def test_reset_sets_last_reset_and_sensors_hide_model_history(
         service="conversation",
     )
     await hass.async_block_till_done()
+
+    cost_entity = hass.data["sensor"].get_entity("sensor.xai_grok_estimated_cost")
+    assert cost_entity is not None
+    assert cost_entity.state_class is SensorStateClass.TOTAL
 
     cost = hass.states.get("sensor.xai_grok_estimated_cost")
     assert cost is not None
