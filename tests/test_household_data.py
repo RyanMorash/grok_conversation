@@ -43,9 +43,18 @@ def test_utterance_household_matcher() -> None:
     assert utterance_requests_household("who is home")
     assert utterance_requests_household("what's the weather")
     assert utterance_requests_household("is it raining")
+    assert utterance_requests_household("is the family home")
+    assert utterance_requests_household("any guests home")
+    assert utterance_requests_household("how cold is it outside")
     assert not utterance_requests_household("turn on the lights")
     assert not utterance_requests_household("personal note")
     assert not utterance_requests_household("train the model")
+    assert not utterance_requests_household("turn on the family room lights")
+    assert not utterance_requests_household("turn off the guest bedroom light")
+    assert not utterance_requests_household("add milk to the family shopping list")
+    assert not utterance_requests_household("How cold is the freezer?")
+    assert not utterance_requests_household("How hot should I set the oven?")
+    assert not utterance_requests_household("Forecast our revenue for next year")
 
 
 def _entry(options: dict) -> MockConfigEntry:
@@ -223,6 +232,51 @@ async def test_briefing_uses_exposed_groups_in_order(hass: HomeAssistant) -> Non
     capped = collect_home_briefing_lines(hass, per_group_cap=2, max_entities=80)
     lock_lines = [line for line in capped if "(lock." in line]
     assert len(lock_lines) == 2
+
+
+async def test_briefing_filters_each_entity_domain(hass: HomeAssistant) -> None:
+    """A domain filter uses the entity domain, not every domain in the group."""
+    hass.states.async_set(
+        "binary_sensor.front_door",
+        "off",
+        {"device_class": "door", "friendly_name": "Front door"},
+    )
+    hass.states.async_set(
+        "binary_sensor.garage_door",
+        "on",
+        {"device_class": "garage_door", "friendly_name": "Garage door sensor"},
+    )
+    hass.states.async_set(
+        "cover.garage",
+        "closed",
+        {"device_class": "garage", "friendly_name": "Garage door"},
+    )
+    hass.states.async_set(
+        "cover.front",
+        "closed",
+        {"device_class": "door", "friendly_name": "Front door cover"},
+    )
+    for entity_id in (
+        "binary_sensor.front_door",
+        "binary_sensor.garage_door",
+        "cover.garage",
+        "cover.front",
+    ):
+        _expose(hass, entity_id)
+
+    binary = "\n".join(
+        collect_home_briefing_lines(hass, domains={"binary_sensor"})
+    )
+    assert "binary_sensor.front_door" in binary
+    assert "binary_sensor.garage_door" in binary
+    assert "cover.garage" not in binary
+    assert "cover.front" not in binary
+
+    covers = "\n".join(collect_home_briefing_lines(hass, domains={"cover"}))
+    assert "cover.garage" in covers
+    assert "cover.front" in covers
+    assert "binary_sensor.front_door" not in covers
+    assert "binary_sensor.garage_door" not in covers
 
 
 async def test_home_briefing_service_sends_exposed_snapshot(

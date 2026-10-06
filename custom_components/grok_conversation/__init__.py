@@ -107,13 +107,6 @@ _QUALITY_UNSUPPORTED_WARNED = False
 # on its own so one domain cannot fill the snapshot.
 HOME_BRIEFING_GROUP_CAP = 8
 _BRIEFING_GROUPS = ("alarm", "lock", "door", "climate", "person")
-_BRIEFING_GROUP_DOMAINS = {
-    "alarm": frozenset({"alarm", "alarm_control_panel"}),
-    "lock": frozenset({"lock"}),
-    "door": frozenset({"door", "binary_sensor", "cover"}),
-    "climate": frozenset({"climate"}),
-    "person": frozenset({"person"}),
-}
 _DOOR_BINARY_CLASSES = frozenset({"door", "garage_door"})
 _DOOR_COVER_CLASSES = frozenset({"door", "garage", "gate"})
 
@@ -166,9 +159,7 @@ def collect_home_briefing_lines(
         group = _briefing_group(state)
         if group is None:
             continue
-        if domains is not None and not (
-            _BRIEFING_GROUP_DOMAINS[group] & domains
-        ):
+        if domains is not None and state.domain not in domains:
             continue
         if not include_unavailable and state.state in ("unavailable", "unknown"):
             continue

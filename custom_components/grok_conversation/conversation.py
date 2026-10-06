@@ -67,19 +67,32 @@ from .entity import (
     _strip_json_from_response,
 )
 
+# Room names ("family room", "guest bedroom") and shopping lists are not
+# presence requests. Require an explicit people or presence question.
 # Short words use boundaries so "personal" and "train" do not count.
 _PEOPLE_QUERY = re.compile(
     r"\b("
-    r"who(?:'s|’s| is) (?:home|away|here)|"
-    r"anyone home|anybody home|is anyone|"
-    r"presence|people|persons?|famil(?:y|ies)|household|guests?"
+    r"who(?:'s|’s| is| are) (?:home|away|here)|"
+    r"(?:anyone|anybody) (?:home|here|away)|"
+    r"is anyone|"
+    r"presence|"
+    r"(?:people|persons?) (?:home|here|away|present)|"
+    r"(?:the |my |our )?(?:family|families) (?:home|here|away)|"
+    r"household (?:home|members|presence)|"
+    r"(?:any )?guests? (?:home|here|present|staying)|"
+    r"any guests?"
     r")\b",
     re.IGNORECASE,
 )
+# Indoor appliances and business forecasts are not weather requests.
 _WEATHER_QUERY = re.compile(
     r"\b("
-    r"weather|forecast|raining|rain|snowing|snow|humid|"
-    r"how (?:hot|cold|warm)|temperature outside|outside temp"
+    r"weather|"
+    r"raining|rain|snowing|snow|humid|"
+    r"temperature outside|outside temp(?:erature)?|"
+    r"how (?:hot|cold|warm|cool) (?:is it|outside)|"
+    r"(?:weather )?forecast (?:for )?(?:today|tonight|tomorrow|"
+    r"the (?:day|week|weekend)|this (?:week|weekend)|outside)"
     r")\b",
     re.IGNORECASE,
 )
