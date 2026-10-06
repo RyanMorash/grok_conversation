@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import hashlib
 import logging
 from types import MappingProxyType
 from typing import Any
@@ -123,6 +125,11 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     }
 )
 
+
+def api_key_unique_id(api_key: str) -> str:
+    """Return a stable unique id for an API key without storing the key."""
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
 RECOMMENDED_OPTIONS = {
     CONF_RECOMMENDED: True,
     CONF_PROMPT: GROK_SYSTEM_PROMPT,
@@ -173,6 +180,20 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
     MINOR_VERSION = 4
 
+    def _api_key_used_by_other_entry(
+        self, api_key: str, *, exclude_entry_id: str | None = None
+    ) -> bool:
+        """Return True when another entry already stores this API key.
+
+        Legacy entries keep ``unique_id=None``, so a hash lookup misses them.
+        """
+        for entry in self._async_current_entries():
+            if exclude_entry_id and entry.entry_id == exclude_entry_id:
+                continue
+            if entry.data.get(CONF_API_KEY) == api_key:
+                return True
+        return False
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -200,6 +221,10 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                     info.get("voice_detail"),
                 )
                 # Still create — conversation works; TTS/STT may need key permissions
+            await self.async_set_unique_id(api_key_unique_id(user_input[CONF_API_KEY]))
+            self._abort_if_unique_id_configured()
+            if self._api_key_used_by_other_entry(user_input[CONF_API_KEY]):
+                return self.async_abort(reason="already_configured")
             options = dict(RECOMMENDED_OPTIONS)
             api_id = pick_default_llm_api(llm.async_get_apis(self.hass))
             if api_id:
@@ -223,6 +248,57 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
             description_placeholders=description_placeholders,
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Start reauth after a rejected API key."""
+        _LOGGER.debug(
+            "Starting reauth for %s (%s)",
+            self.context.get("entry_id"),
+            ", ".join(sorted(entry_data)),
+        )
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm a replacement API key and reload the entry."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                await validate_input(self.hass, user_input)
+            except XAIConnectionError:
+                errors["base"] = "cannot_connect"
+            except XAIAuthError:
+                errors["base"] = "invalid_auth"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected exception during reauth")
+                errors["base"] = "unknown"
+            else:
+                new_key = user_input[CONF_API_KEY]
+                new_id = api_key_unique_id(new_key)
+                reauth_entry = self._get_reauth_entry()
+                existing = self.hass.config_entries.async_entry_for_domain_unique_id(
+                    DOMAIN, new_id
+                )
+                if existing is not None and existing.entry_id != reauth_entry.entry_id:
+                    return self.async_abort(reason="already_configured")
+                if self._api_key_used_by_other_entry(
+                    new_key, exclude_entry_id=reauth_entry.entry_id
+                ):
+                    return self.async_abort(reason="already_configured")
+                return self.async_update_reload_and_abort(
+                    reauth_entry,
+                    data_updates={CONF_API_KEY: new_key},
+                    unique_id=new_id,
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=STEP_USER_DATA_SCHEMA,
+            errors=errors,
         )
 
     @staticmethod
