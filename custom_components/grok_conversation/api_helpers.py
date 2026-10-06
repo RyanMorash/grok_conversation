@@ -76,6 +76,10 @@ class XAIRateLimitError(XAIError):
     """Rate limited or quota exhausted."""
 
 
+class CombinedSearchRejected(Exception):
+    """Tools and live search were rejected together on one chat.create."""
+
+
 @dataclass(slots=True)
 class ChatToolCall:
     """Normalized client-side tool call from a chat response."""
@@ -489,8 +493,7 @@ def _maybe_reasoning_effort(model: str, reasoning_effort: str | None) -> str | N
     return None
 
 
-async def async_chat_completion(
-    client: Any,
+def _chat_create_kwargs(
     *,
     model: str,
     messages: list[dict[str, Any]],
@@ -503,8 +506,8 @@ async def async_chat_completion(
     user: str | None = None,
     response_format: dict[str, Any] | None = None,
     search_parameters: SearchParameters | None = None,
-) -> ChatResult:
-    """Sample a chat completion via xai-sdk."""
+) -> dict[str, Any]:
+    """Build chat.create kwargs shared by sample() and stream()."""
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": convert_messages(messages),
@@ -536,12 +539,81 @@ async def async_chat_completion(
         bool(converted_format),
         search_parameters is not None,
     )
+    return kwargs
+
+
+async def async_chat_completion(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    reasoning_effort: str | None = None,
+    user: str | None = None,
+    response_format: dict[str, Any] | None = None,
+    search_parameters: SearchParameters | None = None,
+) -> ChatResult:
+    """Sample a chat completion via xai-sdk."""
+    kwargs = _chat_create_kwargs(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        tools=tools,
+        tool_choice=tool_choice,
+        reasoning_effort=reasoning_effort,
+        user=user,
+        response_format=response_format,
+        search_parameters=search_parameters,
+    )
     try:
         chat = client.chat.create(**kwargs)
         response = await chat.sample()
     except Exception as err:  # noqa: BLE001
         raise map_xai_error(err) from err
     return chat_result_from_response(response)
+
+
+async def async_chat_stream(
+    client: Any,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    reasoning_effort: str | None = None,
+    user: str | None = None,
+    response_format: dict[str, Any] | None = None,
+    search_parameters: SearchParameters | None = None,
+):
+    """Yield ``(response, chunk)`` pairs from ``chat.stream()``."""
+    kwargs = _chat_create_kwargs(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        tools=tools,
+        tool_choice=tool_choice,
+        reasoning_effort=reasoning_effort,
+        user=user,
+        response_format=response_format,
+        search_parameters=search_parameters,
+    )
+    try:
+        chat = client.chat.create(**kwargs)
+        async for response, chunk in chat.stream():
+            yield response, chunk
+    except Exception as err:  # noqa: BLE001
+        raise map_xai_error(err) from err
 
 
 async def async_responses_completion(

@@ -16,8 +16,10 @@ from homeassistant.util import dt as dt_util
 
 from . import GrokConfigEntry
 from .api_helpers import (
+    CombinedSearchRejected,
     XAIError,
     async_responses_completion,
+    build_search_parameters,
     looks_like_search_query,
     looks_like_simple_query,
     should_use_live_search,
@@ -67,6 +69,10 @@ from .entity import (
     _strip_json_from_response,
 )
 
+# Spoken Assist turns stop the chat stream here. The shared client timeout
+# stays at 120 seconds so AI Task is unchanged.
+SATELLITE_STREAM_TIMEOUT_SECONDS = 45.0
+
 # Room names ("family room", "guest bedroom") and shopping lists are not
 # presence requests. Require an explicit people or presence question.
 # Short words use boundaries so "personal" and "train" do not count.
@@ -113,6 +119,30 @@ def utterance_requests_household(text: str) -> bool:
     return utterance_requests_people(text) or utterance_requests_weather(text)
 
 
+def _merge_system_note(
+    messages: list[dict[str, Any]], note: str
+) -> list[dict[str, Any]]:
+    """Append note to the first system message, or insert one."""
+    if not note:
+        return list(messages)
+    merged: list[dict[str, Any]] = []
+    inserted = False
+    for msg in messages:
+        if (
+            not inserted
+            and isinstance(msg, dict)
+            and msg.get("role") == "system"
+            and isinstance(msg.get("content"), str)
+        ):
+            merged.append({**msg, "content": f"{msg['content']}\n\n{note}"})
+            inserted = True
+        else:
+            merged.append(msg)
+    if not inserted:
+        merged.insert(0, {"role": "system", "content": note})
+    return merged
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: GrokConfigEntry,
@@ -132,6 +162,7 @@ class OpenAIConversationEntity(
 
     _attr_has_entity_name = True
     _attr_name = None
+    _attr_supports_streaming = True
 
     def __init__(self, entry: GrokConfigEntry) -> None:
         """Initialize the agent."""
@@ -551,131 +582,204 @@ class OpenAIConversationEntity(
             user_input.device_id
         )
 
-        # Live search via Responses API. Previously this was skipped whenever HA
-        # tools were present (#26), which made Live Search a no-op for Assist users.
-        # Pipeline mode uses an inverted heuristic (#30): deny-list only.
+        # Live search via one chat.create when possible. Previously this was
+        # skipped whenever HA tools were present (#26). Pipeline mode uses an
+        # inverted heuristic (#30): deny-list only.
         use_search = should_use_live_search(
             user_input.text,
             interaction_mode=mode,
             live_search=live_search,
         )
         ha_tools_available = bool(chat_log.llm_api and chat_log.llm_api.tools)
-
+        search_system: list[str] = []
+        search_parameters = None
         if use_search:
-            # Soften overlay: score/facts first, then honor persona (#32)
-            search_system = [
-                "You have live web/X search. Lead with the key fact or score, "
-                "then briefly add context or opinion when the user's prompt "
-                "asks for personality.",
-                "Be concise. Prefer scores, times, and concrete outcomes first.",
-                "Honor the user's personality/system prompt — keep voice and style.",
-                "If results are uncertain, say what you found and what is unknown.",
-                "When the user says 'near me' / local / open now, use the home "
-                "location and local time below — do not ask them for a city.",
-            ]
-            if effective_prompt:
-                search_system.append(str(effective_prompt))
-            # Factual context ALWAYS reaches the search pass (#27), even with HA tools
-            factual = self._build_factual_context(user_input)
-            if factual:
-                search_system.append(factual)
-            # Always attach persona/voice on the search pass (#32) — previously
-            # skipped whenever HA tools were present, which made Assist sound
-            # like a recap bot.
-            persona = self._build_persona_context(user_input)
-            if persona:
-                search_system.append(persona)
-            if user_extra:
-                search_system.append(user_extra)
+            search_system = self._live_search_instructions(
+                user_input, effective_prompt, user_extra
+            )
+            search_parameters = build_search_parameters(
+                live_search, return_citations=show_citations_effective
+            )
 
-            search_messages = [
-                m for m in messages if m.get("role") != "system"
-            ]
+        stream_timeout = (
+            SATELLITE_STREAM_TIMEOUT_SECONDS if user_input.device_id else None
+        )
+        instructed = (
+            _merge_system_note(messages, "\n\n".join(search_system))
+            if search_parameters is not None
+            else messages
+        )
+        combined = bool(ha_tools_available and search_parameters is not None)
+
+        if combined:
             try:
-                text, p_tok, c_tok = await async_responses_completion(
-                    client,
+                await self._async_chat_log_turn(
+                    chat_log,
+                    user_input=user_input,
                     model=model,
-                    messages=search_messages,  # type: ignore[arg-type]
-                    system_prompt="\n\n".join(search_system) or None,
-                    max_tokens=options.get(CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS),
-                    temperature=options.get(
-                        CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
-                    ),
-                    top_p=options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
-                    live_search=live_search,
-                    show_citations=show_citations_effective,
-                    reasoning_effort=options.get(CONF_REASONING_EFFORT),
+                    options=options,
+                    messages=instructed,
+                    fallback_model=fallback_model,
+                    search_parameters=search_parameters,
+                    stream_final=True,
+                    stream_timeout=stream_timeout,
+                    append_citations=show_citations_effective,
                 )
-                text = _strip_json_from_response(text)
-                await self._record_usage(
-                    model, p_tok, c_tok, service="conversation"
-                )
-
-                if text and not ha_tools_available:
-                    # Search-only path (chat_only or no LLM HASS API)
-                    async for _ in chat_log.async_add_assistant_content(
-                        conversation.AssistantContent(
-                            agent_id=user_input.agent_id, content=text
-                        )
-                    ):
-                        pass
-                    intent_response = intent.IntentResponse(
-                        language=user_input.language
-                    )
-                    intent_response.async_set_speech(text)
-                    return conversation.ConversationResult(
-                        response=intent_response,
-                        conversation_id=chat_log.conversation_id,
-                        continue_conversation=await self._resolve_continue_conversation(
-                            user_input, chat_log, text
-                        ),
-                    )
-
-                if text and ha_tools_available:
-                    # Two-pass (#26): inject live findings into the tool loop so
-                    # Assist control and live search work together.
-                    brief = text.strip()
-                    if len(brief) > 4000:
-                        brief = brief[:4000] + "…"
-                    search_note = (
-                        "Live search results for this user question "
-                        "(use these facts; do not claim you lack real-time data):\n"
-                        f"{brief}"
-                    )
-                    new_messages: list[dict[str, Any]] = []
-                    inserted = False
-                    for msg in messages:
-                        if (
-                            not inserted
-                            and isinstance(msg, dict)
-                            and msg.get("role") == "system"
-                            and isinstance(msg.get("content"), str)
-                        ):
-                            new_messages.append(
-                                {
-                                    "role": "system",
-                                    "content": f"{msg['content']}\n\n{search_note}",
-                                }
-                            )
-                            inserted = True
-                        else:
-                            new_messages.append(msg)
-                    if not inserted:
-                        new_messages.insert(
-                            0, {"role": "system", "content": search_note}
-                        )
-                    messages = new_messages
-                    LOGGER.debug(
-                        "Injected live search brief (%s chars) into tool loop",
-                        len(brief),
-                    )
-            except Exception as err:  # noqa: BLE001
+            except CombinedSearchRejected as err:
                 LOGGER.warning(
-                    "Live search path failed (%s); continuing without search context",
+                    "Combined live search and tools call failed (%s); "
+                    "continuing with two-pass",
                     err,
                 )
+                legacy = await self._async_legacy_live_search(
+                    user_input=user_input,
+                    chat_log=chat_log,
+                    client=client,
+                    model=model,
+                    options=options,
+                    messages=messages,
+                    search_system=search_system,
+                    live_search=live_search,
+                    show_citations_effective=show_citations_effective,
+                    ha_tools_available=ha_tools_available,
+                )
+                if isinstance(legacy, conversation.ConversationResult):
+                    return legacy
+                await self._async_chat_log_turn(
+                    chat_log,
+                    user_input=user_input,
+                    model=model,
+                    options=options,
+                    messages=legacy,
+                    fallback_model=fallback_model,
+                )
+        else:
+            await self._async_chat_log_turn(
+                chat_log,
+                user_input=user_input,
+                model=model,
+                options=options,
+                messages=instructed,
+                fallback_model=fallback_model,
+                search_parameters=search_parameters,
+                stream_final=True,
+                stream_timeout=stream_timeout,
+                append_citations=bool(
+                    show_citations_effective and search_parameters is not None
+                ),
+            )
 
-        # Shared chat-completions + tool loop (entity base)
+        return await self._async_result_from_log(user_input, chat_log)
+
+    def _live_search_instructions(
+        self,
+        user_input: conversation.ConversationInput,
+        effective_prompt: str | None,
+        user_extra: str,
+    ) -> list[str]:
+        """System lines for a live-search turn (facts, persona, local context)."""
+        # Soften overlay: score/facts first, then honor persona (#32)
+        search_system = [
+            "You have live web/X search. Lead with the key fact or score, "
+            "then briefly add context or opinion when the user's prompt "
+            "asks for personality.",
+            "Be concise. Prefer scores, times, and concrete outcomes first.",
+            "Honor the user's personality/system prompt — keep voice and style.",
+            "If results are uncertain, say what you found and what is unknown.",
+            "When the user says 'near me' / local / open now, use the home "
+            "location and local time below — do not ask them for a city.",
+        ]
+        if effective_prompt:
+            search_system.append(str(effective_prompt))
+        # Factual context ALWAYS reaches the search call (#27), even with HA tools
+        factual = self._build_factual_context(user_input)
+        if factual:
+            search_system.append(factual)
+        # Always attach persona/voice on the search call (#32).
+        persona = self._build_persona_context(user_input)
+        if persona:
+            search_system.append(persona)
+        if user_extra:
+            search_system.append(user_extra)
+        return search_system
+
+    async def _async_legacy_live_search(
+        self,
+        *,
+        user_input: conversation.ConversationInput,
+        chat_log: conversation.ChatLog,
+        client: Any,
+        model: str,
+        options: dict[str, Any],
+        messages: list[dict[str, Any]],
+        search_system: list[str],
+        live_search: str,
+        show_citations_effective: bool,
+        ha_tools_available: bool,
+    ) -> conversation.ConversationResult | list[dict[str, Any]]:
+        """Two-pass search sample used only when tools+search on one create fails.
+
+        Returns a conversation result for a search-only reply, or the messages
+        to continue into the tool loop.
+        """
+        search_messages = [m for m in messages if m.get("role") != "system"]
+        try:
+            text, p_tok, c_tok = await async_responses_completion(
+                client,
+                model=model,
+                messages=search_messages,  # type: ignore[arg-type]
+                system_prompt="\n\n".join(search_system) or None,
+                max_tokens=options.get(CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS),
+                temperature=options.get(CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE),
+                top_p=options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
+                live_search=live_search,
+                show_citations=show_citations_effective,
+                reasoning_effort=options.get(CONF_REASONING_EFFORT),
+            )
+            text = _strip_json_from_response(text)
+            await self._record_usage(model, p_tok, c_tok, service="conversation")
+
+            if text and not ha_tools_available:
+                async for _ in chat_log.async_add_assistant_content(
+                    conversation.AssistantContent(
+                        agent_id=user_input.agent_id, content=text
+                    )
+                ):
+                    pass
+                return await self._async_result_from_log(user_input, chat_log)
+
+            if text and ha_tools_available:
+                brief = text.strip()
+                if len(brief) > 4000:
+                    brief = brief[:4000] + "…"
+                search_note = (
+                    "Live search results for this user question "
+                    "(use these facts; do not claim you lack real-time data):\n"
+                    f"{brief}"
+                )
+                return _merge_system_note(messages, search_note)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning(
+                "Live search path failed (%s); continuing without search context",
+                err,
+            )
+        return messages
+
+    async def _async_chat_log_turn(
+        self,
+        chat_log: conversation.ChatLog,
+        *,
+        user_input: conversation.ConversationInput,
+        model: str,
+        options: dict[str, Any],
+        messages: list[dict[str, Any]],
+        fallback_model: str | None,
+        search_parameters: Any | None = None,
+        stream_final: bool = False,
+        stream_timeout: float | None = None,
+        append_citations: bool = False,
+    ) -> None:
+        """Run the shared tool loop and map xAI errors."""
         try:
             await self._async_handle_chat_log(
                 chat_log,
@@ -685,12 +789,22 @@ class OpenAIConversationEntity(
                 agent_id=user_input.agent_id,
                 service="conversation",
                 fallback_model=fallback_model,
+                search_parameters=search_parameters,
+                stream_final=stream_final,
+                stream_timeout=stream_timeout,
+                append_citations=append_citations,
             )
         except HomeAssistantError:
             raise
         except XAIError as err:
             raise HomeAssistantError(f"Error talking to xAI: {err}") from err
 
+    async def _async_result_from_log(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log: conversation.ChatLog,
+    ) -> conversation.ConversationResult:
+        """Build the Assist result from the last assistant text."""
         intent_response = intent.IntentResponse(language=user_input.language)
         speech = self._pick_speech_content(chat_log)
         if speech:
@@ -699,7 +813,6 @@ class OpenAIConversationEntity(
             intent_response.async_set_speech(
                 "Sorry, I couldn't generate a response."
             )
-
         return conversation.ConversationResult(
             response=intent_response,
             conversation_id=chat_log.conversation_id,
