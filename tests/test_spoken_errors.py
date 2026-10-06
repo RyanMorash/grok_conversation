@@ -16,7 +16,6 @@ from custom_components.grok_conversation.api_helpers import (
     XAIAuthError,
     XAIRateLimitError,
 )
-from custom_components.grok_conversation.const import DOMAIN
 from custom_components.grok_conversation.conversation import spoken_error_translation_key
 from custom_components.grok_conversation.exceptions import TokenLengthExceededError
 
@@ -71,21 +70,24 @@ def _user_input(agent, text: str) -> conversation.ConversationInput:
     )
 
 
-async def _raise_from_handler(
+def _speech(result: conversation.ConversationResult) -> str:
+    return result.response.speech["plain"]["speech"]
+
+
+async def _converse(
     hass: HomeAssistant,
     entry: MockConfigEntry,
-    client,
     text: str,
-) -> HomeAssistantError:
-    agent = conversation.async_get_agent(hass, entry.entry_id)
-    assert agent is not None
-    chat_log = ChatLog(hass=hass, conversation_id="spoken-errors")
-    chat_log.async_add_user_content(conversation.UserContent(content=text))
-    with pytest.raises(HomeAssistantError) as caught:
-        await agent._async_handle_message(  # noqa: SLF001
-            _user_input(agent, text), chat_log
-        )
-    return caught.value
+    language: str,
+) -> conversation.ConversationResult:
+    return await conversation.async_converse(
+        hass,
+        text,
+        conversation_id=None,
+        context=Context(),
+        language=language,
+        agent_id=entry.entry_id,
+    )
 
 
 def test_spoken_error_strings_are_translated() -> None:
@@ -122,32 +124,26 @@ def test_mapper_ignores_unrelated_errors() -> None:
     assert spoken_error_translation_key(wrapped) == "auth_failed"
 
 
-async def test_rate_limit_auth_and_token_length_reach_assist(
+async def test_async_converse_speaks_the_user_language(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_xai_client,
 ) -> None:
-    """Those failures leave the handler as translated HomeAssistantError."""
+    """Public Assist speech uses user_input.language, not English HomeAssistantError."""
     _install_raising_stream(mock_xai_client, XAIRateLimitError("quota"))
-    rate = await _raise_from_handler(
-        hass, mock_config_entry, mock_xai_client, "turn on the lights"
+    french = await _converse(
+        hass, mock_config_entry, "allume la lumière", "fr"
     )
-    assert rate.translation_domain == DOMAIN
-    assert rate.translation_key == "rate_limit"
+    assert "occupé" in _speech(french)
+    assert "busy" not in _speech(french).lower()
 
     _install_raising_stream(mock_xai_client, XAIAuthError("revoked"))
-    auth = await _raise_from_handler(
-        hass, mock_config_entry, mock_xai_client, "hello"
-    )
-    assert auth.translation_key == "auth_failed"
-    assert isinstance(auth.__cause__, HomeAssistantError)
+    english = await _converse(hass, mock_config_entry, "hello", "en")
+    assert "API key" in _speech(english)
 
     _install_length_stream(mock_xai_client)
-    length = await _raise_from_handler(
-        hass, mock_config_entry, mock_xai_client, "explain in detail"
-    )
-    assert length.translation_key == "token_length"
-    assert isinstance(length.__cause__, TokenLengthExceededError)
+    length = await _converse(hass, mock_config_entry, "explain in detail", "de")
+    assert "abgeschnitten" in _speech(length)
 
 
 async def test_other_home_assistant_errors_reach_assist(

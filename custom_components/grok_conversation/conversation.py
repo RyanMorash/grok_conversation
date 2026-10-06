@@ -107,6 +107,22 @@ _WEATHER_QUERY = re.compile(
 )
 
 
+async def async_spoken_error_message(
+    hass: HomeAssistant, language: str, key: str
+) -> str:
+    """Return the short speech for ``key`` in the utterance language."""
+    from homeassistant.helpers.translation import async_get_translations
+
+    localize_key = f"component.{DOMAIN}.exceptions.{key}.message"
+    for lang in dict.fromkeys((language or "en", "en")):
+        translations = await async_get_translations(
+            hass, lang, "exceptions", integrations={DOMAIN}
+        )
+        if message := translations.get(localize_key):
+            return message
+    return key
+
+
 def spoken_error_translation_key(err: BaseException) -> str | None:
     """Map rate limit, auth failure, and token length to short speech keys."""
     if isinstance(err, TokenLengthExceededError):
@@ -242,16 +258,24 @@ class OpenAIConversationEntity(
         try:
             return await self._async_handle_message_inner(user_input, chat_log)
         except HomeAssistantError as err:
-            # Assist speaks HomeAssistantError. The three known failures use
-            # short translated strings; every other HomeAssistantError passes
-            # through unchanged.
+            # HomeAssistantError stringifies in English. Speak the catalog
+            # string for this turn's language instead of letting Assist do that.
             key = spoken_error_translation_key(err)
             if key is None:
                 raise
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key=key,
-            ) from err
+            message = await async_spoken_error_message(
+                self.hass, user_input.language, key
+            )
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                message,
+            )
+            return conversation.ConversationResult(
+                response=intent_response,
+                conversation_id=chat_log.conversation_id if chat_log else "",
+                continue_conversation=False,
+            )
         except Exception as err:  # noqa: BLE001
             LOGGER.error(
                 "Unexpected error in conversation handler: %s", err, exc_info=True
