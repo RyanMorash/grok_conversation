@@ -6,7 +6,6 @@ import logging
 from types import MappingProxyType
 from typing import Any
 
-import openai
 import voluptuous as vol
 
 from homeassistant.config_entries import (
@@ -21,7 +20,6 @@ from homeassistant.const import CONF_API_KEY, CONF_LLM_HASS_API, CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
@@ -87,7 +85,16 @@ from .const import (
     UNSUPPORTED_MODELS,
     effective_model_choice,
 )
-from .api_helpers import async_list_chat_models, is_chat_model_id
+from .api_helpers import (
+    PROBE_TIMEOUT_SECONDS,
+    XAIAuthError,
+    XAIConnectionError,
+    async_list_chat_models,
+    close_xai_client,
+    create_xai_client,
+    is_chat_model_id,
+    map_xai_error,
+)
 from .voice_const import (
     CONF_ENABLE_STT,
     CONF_ENABLE_TTS,
@@ -140,24 +147,17 @@ RECOMMENDED_OPTIONS = {
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate the user input allows us to connect. Returns voice probe info."""
-
-    def sync_validate():
-        client = openai.AsyncOpenAI(
-            api_key=data[CONF_API_KEY],
-            base_url="https://api.x.ai/v1",
-            http_client=get_async_client(hass),
-        )
-        return client.with_options(timeout=10.0).models.list()
-
+    client = create_xai_client(data[CONF_API_KEY], timeout=PROBE_TIMEOUT_SECONDS)
     try:
-        await hass.async_add_executor_job(sync_validate)
-    except openai.APIConnectionError:
-        raise
-    except openai.AuthenticationError:
-        raise
-    except Exception:
+        await client.models.list_language_models()
+    except Exception as err:  # noqa: BLE001
+        mapped = map_xai_error(err)
+        if isinstance(mapped, (XAIAuthError, XAIConnectionError)):
+            raise mapped from err
         _LOGGER.exception("Unexpected exception during validation")
-        raise
+        raise mapped from err
+    finally:
+        await close_xai_client(client)
 
     session = async_get_clientsession(hass)
     voice_ok, voice_detail = await async_validate_voice_access(
@@ -186,9 +186,9 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
 
         try:
             info = await validate_input(self.hass, user_input)
-        except openai.APIConnectionError:
+        except XAIConnectionError:
             errors["base"] = "cannot_connect"
-        except openai.AuthenticationError:
+        except XAIAuthError:
             errors["base"] = "invalid_auth"
         except Exception:  # noqa: BLE001
             errors["base"] = "unknown"
@@ -254,12 +254,11 @@ class OpenAIOptionsFlow(OptionsFlow):
             return self._chat_models
 
         api_key = self.config_entry.data.get(CONF_API_KEY, "")
-        client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://api.x.ai/v1",
-            http_client=get_async_client(self.hass),
-        )
-        models = await async_list_chat_models(client)
+        client = create_xai_client(api_key, timeout=PROBE_TIMEOUT_SECONDS)
+        try:
+            models = await async_list_chat_models(client)
+        finally:
+            await close_xai_client(client)
         # Never offer retired ids in the picker
         models = [m for m in models if m not in RETIRED_MODELS]
 
@@ -767,12 +766,11 @@ class GrokAITaskSubentryFlowHandler(ConfigSubentryFlow):
 
         entry = self._get_entry()
         api_key = entry.data.get(CONF_API_KEY, "")
-        client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://api.x.ai/v1",
-            http_client=get_async_client(self.hass),
-        )
-        models = await async_list_chat_models(client)
+        client = create_xai_client(api_key, timeout=PROBE_TIMEOUT_SECONDS)
+        try:
+            models = await async_list_chat_models(client)
+        finally:
+            await close_xai_client(client)
         models = [m for m in models if m not in RETIRED_MODELS]
 
         current = effective_model_choice(

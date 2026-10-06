@@ -17,7 +17,7 @@ One HACS install → **Conversation agent**, **Speech-to-text**, **Text-to-speec
 | **Conversation** | Voice assistants → Conversation agent → **Grok** | Chat / tools / live search |
 | **Speech-to-text** | Voice assistants → Speech-to-text → **xAI Grok** | `POST https://api.x.ai/v1/stt` |
 | **Text-to-speech** | Voice assistants → Text-to-speech → **xAI Grok** | `POST https://api.x.ai/v1/tts` |
-| **AI Task** | Automations → `ai_task.generate_data` → **Grok AI Task** | Chat Completions + structured output / attachments |
+| **AI Task** | Automations → `ai_task.generate_data` → **Grok AI Task** | Chat + structured output / attachments |
 
 Replace Piper / speech-to-phrase with Grok cloud quality while keeping your Satellite1 (or any Assist pipeline) wake word local.
 
@@ -116,13 +116,11 @@ Generate images with Grok Imagine. Only documented xAI parameters are sent.
 | --- | --- |
 | `prompt` | Required |
 | `model` | Default `grok-imagine-image`. xAI recommends `grok-imagine-image-2.0` |
-| `aspect_ratio` | Optional (`1:1`, `16:9`, `9:16`, …). Omit for xAI `auto` |
+| `aspect_ratio` | Optional (`1:1`, `16:9`, `9:16`, `19.5:9`, …). Omit for the SDK default |
 | `resolution` | Optional `1k` / `2k` |
-| `quality` | Optional `low` / `medium` / `auto` (2.0 only) |
+| `quality` | Optional `low` / `medium` (`grok-imagine-image-2.0` only) |
 | `n` | 1–10 (default 1) |
 | `response_format` | `url` (default) or `b64_json` |
-
-Deprecated (still accepted): `size` (mapped to aspect ratio), `style` (ignored), `quality: standard|hd` (ignored).
 
 ```yaml
 action: grok_conversation.generate_image
@@ -182,6 +180,8 @@ CI: Hassfest + HACS validation + pytest on push/PR/nightly.
 ---
 
 ## Version
+
+**1.11.0** — Talk to xAI through the official `xai-sdk` gRPC client (`AsyncClient`) instead of the OpenAI-compatible REST SDK. Conversation, AI Task, live search (`SearchParameters`), image generation, and model listing keep the same Home Assistant UX. `generate_image` schema matches xai-sdk 1.19.0 (`aspect_ratio` / `resolution` / `quality: low|medium`); Voice TTS/STT stay on `POST https://api.x.ai/v1/{tts,stt}`.
 
 **1.10.0** — `generate_image` uses documented xAI params (`aspect_ratio` / `resolution` / `quality` / `n` / `response_format`); deprecated `size` / `style` / `quality: standard|hd` still accepted with warnings; `quality` is sent only for `grok-imagine-image-2.0`. Vision default `grok-4.3` with options picker + shared resolution (image-capable chat model wins; vision option is fallback). Replace retired fast/fallback defaults (`grok-4-1-fast-non-reasoning`, `grok-3-mini-fast`) with `grok-4.3` after the [May 15 2026 retirement](https://docs.x.ai/developers/migration/may-15-retirement) (no cheaper/faster documented non-reasoning tool-calling model remains). Options picker rejects retired ids; runtime remap + warning. Minor-3 migration rewrites stored vision/fast/fallback/chat ids on entry options and conversation/ai_task_data subentries.
 

@@ -125,7 +125,7 @@
         },
         "aspect_ratio": {
           "name": "Aspect ratio",
-          "description": "Image aspect ratio (omit for xAI auto)"
+          "description": "Image aspect ratio (omit for the SDK default)"
         },
         "resolution": {
           "name": "Resolution",
@@ -133,7 +133,7 @@
         },
         "quality": {
           "name": "Quality",
-          "description": "Image quality (low/medium/auto). Only applies to grok-imagine-image-2.0"
+          "description": "Image quality (low/medium). Only applies to grok-imagine-image-2.0"
         },
         "n": {
           "name": "Number of images",

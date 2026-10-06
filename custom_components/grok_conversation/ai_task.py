@@ -22,14 +22,14 @@ from .entity import GrokBaseLLMEntity, model_supports_vision
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigSubentry
 
-    from . import OpenAIConfigEntry
+    from . import GrokConfigEntry
 
 PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: OpenAIConfigEntry,
+    config_entry: GrokConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up AI Task entities."""
@@ -47,7 +47,7 @@ class GrokAITaskEntity(ai_task.AITaskEntity, GrokBaseLLMEntity):
     """Grok AI Task entity (generate_data; generate_image deferred)."""
 
     def __init__(
-        self, entry: OpenAIConfigEntry, subentry: ConfigSubentry
+        self, entry: GrokConfigEntry, subentry: ConfigSubentry
     ) -> None:
         """Initialize the entity."""
         super().__init__(entry, subentry)

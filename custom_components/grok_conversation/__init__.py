@@ -9,9 +9,6 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
-import openai
-from openai.types.chat import ChatCompletionMessageParam
-from openai.types.images_response import ImagesResponse
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
@@ -29,13 +26,18 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.typing import ConfigType
 
 from .api_helpers import (
+    PROBE_TIMEOUT_SECONDS,
+    XAIAuthError,
+    XAIError,
     async_chat_completion,
+    async_generate_images,
     async_responses_completion,
-    extract_usage,
+    close_xai_client,
+    create_xai_client,
+    map_xai_error,
 )
 from .const import (
     CONF_CHAT_MODEL,
@@ -56,11 +58,8 @@ from .const import (
     DOMAIN,
     IMAGE_ASPECT_RATIOS,
     IMAGE_QUALITIES,
-    IMAGE_QUALITY_DOCUMENTED,
     IMAGE_RESOLUTIONS,
     IMAGE_RESPONSE_FORMATS,
-    IMAGE_SIZES,
-    IMAGE_STYLES,
     LIVE_SEARCH_OFF,
     LOGGER,
     RECOMMENDED_AI_TASK_OPTIONS,
@@ -82,7 +81,6 @@ from .const import (
     SERVICE_PHOTO_ANALYSIS,
     SERVICE_QUERY_IMAGE,
     SERVICE_RESET_STATS,
-    SIZE_TO_ASPECT_RATIO,
     remap_retired_chat_model,
 )
 from .entity import resolve_vision_model
@@ -98,20 +96,11 @@ PLATFORMS = (
 )
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-OpenAIConfigEntry = ConfigEntry  # runtime_data: openai.AsyncClient
+GrokConfigEntry = ConfigEntry  # runtime_data: xai_sdk.AsyncClient
+OpenAIConfigEntry = GrokConfigEntry  # backward-compatible alias
 
-# One deprecation WARNING per field per Home Assistant run.
-_DEPRECATED_FIELD_WARNED: set[str] = set()
 _RETIRED_VISION_WARNED = False
 _QUALITY_UNSUPPORTED_WARNED = False
-
-
-def _warn_deprecated_image_field(field: str, message: str) -> None:
-    """Log a one-shot deprecation warning for a generate_image field."""
-    if field in _DEPRECATED_FIELD_WARNED:
-        return
-    _DEPRECATED_FIELD_WARNED.add(field)
-    LOGGER.warning(message)
 
 
 def model_supports_image_quality(model: str | None) -> bool:
@@ -129,55 +118,18 @@ def model_supports_image_quality(model: str | None) -> bool:
 
 
 def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[str, Any]:
-    """Build kwargs for client.images.generate from service call data.
+    """Build kwargs for client.image.sample / sample_batch from service call data.
 
-    Never sends ``size`` or ``style``. Sends documented ``quality``
-    (``low``/``medium``/``auto``) via ``extra_body`` only when the model
-    supports it (``grok-imagine-image-2.0``).
+    Maps service ``response_format`` ``url|b64_json`` to SDK ``image_format``
+    ``url|base64``. Sends ``quality`` only for ``grok-imagine-image-2.0``.
     """
     global _QUALITY_UNSUPPORTED_WARNED
 
     aspect_ratio = call_data.get("aspect_ratio")
-    size = call_data.get("size")
-    style = call_data.get("style")
     quality = call_data.get("quality")
     resolution = call_data.get("resolution")
     n = int(call_data.get("n", 1))
     response_format = call_data.get("response_format", "url")
-
-    if style is not None:
-        _warn_deprecated_image_field(
-            "style",
-            "generate_image field 'style' is deprecated and ignored by xAI; "
-            "it will be removed in a future release.",
-        )
-
-    if size is not None:
-        mapped = SIZE_TO_ASPECT_RATIO.get(size)
-        if aspect_ratio is None and mapped:
-            aspect_ratio = mapped
-            _warn_deprecated_image_field(
-                "size",
-                "generate_image field 'size' is deprecated; mapped "
-                f"'{size}' → aspect_ratio '{mapped}'. "
-                "It will be removed in a future release.",
-            )
-        else:
-            _warn_deprecated_image_field(
-                "size",
-                "generate_image field 'size' is deprecated and ignored "
-                f"(aspect_ratio already set to '{aspect_ratio}'). "
-                "It will be removed in a future release.",
-            )
-
-    if quality is not None and quality not in IMAGE_QUALITY_DOCUMENTED:
-        _warn_deprecated_image_field(
-            "quality",
-            "generate_image field 'quality' value "
-            f"'{quality}' is deprecated and ignored (use low|medium|auto for "
-            "grok-imagine-image-2.0). It will be removed in a future release.",
-        )
-        quality = None
 
     if quality is not None and not model_supports_image_quality(model):
         if not _QUALITY_UNSUPPORTED_WARNED:
@@ -189,56 +141,99 @@ def build_image_generate_kwargs(call_data: dict[str, Any], model: str) -> dict[s
             )
         quality = None
 
+    image_format = "base64" if response_format == "b64_json" else "url"
     kwargs: dict[str, Any] = {
         "model": model,
         "prompt": call_data[CONF_PROMPT],
         "n": n,
-        "response_format": response_format,
+        "image_format": image_format,
     }
-    extra_body: dict[str, Any] = {}
     if aspect_ratio is not None:
-        extra_body["aspect_ratio"] = aspect_ratio
+        kwargs["aspect_ratio"] = aspect_ratio
     if resolution is not None:
-        extra_body["resolution"] = resolution
+        kwargs["resolution"] = resolution
     if quality is not None:
-        extra_body["quality"] = quality
-    if extra_body:
-        kwargs["extra_body"] = extra_body
+        kwargs["quality"] = quality
     return kwargs
 
 
+def _bare_base64(value: Any) -> str:
+    """Return bare base64, stripping an SDK data-URI prefix when present."""
+    text = str(value)
+    marker = "base64,"
+    if marker in text:
+        return text.split(marker, 1)[1]
+    return text
+
+
+def _image_rejected_by_moderation(item: Any) -> bool:
+    """Return True when xai-sdk marked this image as failing moderation."""
+    try:
+        respect = getattr(item, "respect_moderation", True)
+    except (ValueError, AttributeError):
+        return False
+    return respect is False
+
+
+def _safe_image_attr(item: Any, *names: str) -> Any:
+    """Read an image attribute, swallowing SDK ValueError when the field is empty."""
+    for name in names:
+        try:
+            value = getattr(item, name, None)
+        except (ValueError, AttributeError):
+            value = None
+        if value:
+            return value
+    return None
+
+
 def format_images_response(
-    response: ImagesResponse,
+    images: Any,
     *,
     model: str,
     response_format: str,
 ) -> dict[str, Any]:
-    """Format an ImagesResponse into a backward-compatible service result."""
-    if not response.data:
+    """Format image sample results into a backward-compatible service result."""
+    if images is None:
+        raise HomeAssistantError("Image generation returned empty data")
+    data = getattr(images, "data", None)
+    if data is not None:
+        items = list(data)
+    elif isinstance(images, (list, tuple)):
+        items = list(images)
+    else:
+        items = [images]
+    if not items:
         raise HomeAssistantError("Image generation returned empty data")
 
-    images: list[dict[str, Any]] = []
-    for item in response.data:
+    formatted: list[dict[str, Any]] = []
+    for item in items:
+        # SDK url/base64 raise ValueError when respect_moderation is false;
+        # check the flag first so that is not reported as a missing payload.
+        if _image_rejected_by_moderation(item):
+            raise HomeAssistantError(
+                "Image generation rejected by content moderation"
+            )
         entry: dict[str, Any] = {}
-        url = getattr(item, "url", None)
-        b64 = getattr(item, "b64_json", None)
-        mime = getattr(item, "mime_type", None)
+        url = _safe_image_attr(item, "url")
+        b64 = _safe_image_attr(item, "base64", "b64_json")
+        mime = _safe_image_attr(item, "mime_type")
         if url:
             entry["url"] = url
         if b64:
-            entry["b64_json"] = b64
+            entry["b64_json"] = _bare_base64(b64)
         if mime:
             entry["mime_type"] = mime
         if "url" not in entry and "b64_json" not in entry:
             raise HomeAssistantError(
                 "Image generation response missing url and b64_json"
             )
-        images.append(entry)
+        formatted.append(entry)
 
-    result: dict[str, Any] = {"model": model, "images": images}
-    if response_format == "url" and images[0].get("url"):
-        result["url"] = images[0]["url"]
-    revised = getattr(response.data[0], "revised_prompt", None)
+    result: dict[str, Any] = {"model": model, "images": formatted}
+    if response_format == "url" and formatted[0].get("url"):
+        result["url"] = formatted[0]["url"]
+    revised = _safe_image_attr(items[0], "revised_prompt", "prompt")
     if revised:
         result["revised_prompt"] = revised
     return result
@@ -288,7 +283,7 @@ def encode_file(file_path: str) -> tuple[str, str]:
         raise HomeAssistantError(f"Error reading file {file_path}: {err}") from err
 
 
-def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> OpenAIConfigEntry:
+def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> GrokConfigEntry:
     """Validate and return config entry."""
     entry = hass.config_entries.async_get_entry(entry_id)
     if entry is None or entry.domain != DOMAIN:
@@ -300,7 +295,7 @@ def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> OpenAIConfigEn
     return entry  # type: ignore[return-value]
 
 
-def _entry_client(entry: OpenAIConfigEntry) -> openai.AsyncClient:
+def _entry_client(entry: GrokConfigEntry) -> Any:
     return entry.runtime_data
 
 
@@ -345,12 +340,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         kwargs = build_image_generate_kwargs(dict(call.data), model)
 
         try:
-            response: ImagesResponse = await client.images.generate(**kwargs)
-        except openai.OpenAIError as err:
+            images = await async_generate_images(client, **kwargs)
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating image: {err}") from err
 
         result = format_images_response(
-            response, model=model, response_format=response_format
+            images, model=model, response_format=response_format
         )
         await _record_usage(
             hass,
@@ -434,8 +429,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             CONF_REASONING_EFFORT, entry.options.get(CONF_REASONING_EFFORT)
         )
 
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "user", "content": content}  # type: ignore[typeddict-item]
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": content}
         ]
 
         try:
@@ -455,16 +450,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 response = await async_chat_completion(
                     client,
                     model=model,
-                    messages=messages,  # type: ignore[arg-type]
+                    messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     reasoning_effort=reasoning_effort,
                     user=call.context.user_id,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating content: {err}") from err
 
         await _record_usage(
@@ -531,9 +526,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                     top_p=top_p,
                     reasoning_effort=reasoning_effort,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error in ask service: {err}") from err
 
         await _record_usage(
@@ -617,9 +612,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 temperature=call.data.get(CONF_TEMPERATURE),
                 top_p=call.data.get(CONF_TOP_P),
             )
-            text = response.choices[0].message.content or ""
-            p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+            text = response.content
+            p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error analyzing photo: {err}") from err
 
         await _record_usage(
@@ -785,9 +780,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                     max_tokens=call.data.get(CONF_MAX_TOKENS, 500),
                     temperature=0.7,
                 )
-                text = response.choices[0].message.content or ""
-                p_tok, c_tok = extract_usage(response)
-        except openai.OpenAIError as err:
+                text = response.content
+                p_tok, c_tok = response.prompt_tokens, response.completion_tokens
+        except XAIError as err:
             raise HomeAssistantError(f"Error generating home briefing: {err}") from err
 
         await _record_usage(
@@ -849,9 +844,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Optional("response_format", default="url"): vol.In(
                     IMAGE_RESPONSE_FORMATS
                 ),
-                # Deprecated — still validated so existing automations work
-                vol.Optional("size"): vol.In(IMAGE_SIZES),
-                vol.Optional("style"): vol.In(IMAGE_STYLES),
             }
         ),
         supports_response=SupportsResponse.ONLY,
@@ -952,53 +944,55 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool:
     """Set up Grok Conversation from a config entry."""
-    client = openai.AsyncOpenAI(
-        api_key=entry.data[CONF_API_KEY],
-        base_url="https://api.x.ai/v1",
-        http_client=get_async_client(hass),
-    )
-
-    # Cache current platform data which gets added to each request (caching done by library)
-    _ = await hass.async_add_executor_job(client.platform_headers)
-
+    api_key = entry.data[CONF_API_KEY]
+    probe = create_xai_client(api_key, timeout=PROBE_TIMEOUT_SECONDS)
     try:
-        await hass.async_add_executor_job(client.with_options(timeout=10.0).models.list)
-    except openai.AuthenticationError as err:
-        LOGGER.error("Invalid API key: %s", err)
-        return False
-    except openai.OpenAIError as err:
-        raise ConfigEntryNotReady(err) from err
+        await probe.models.list_language_models()
+    except Exception as err:  # noqa: BLE001
+        mapped = map_xai_error(err)
+        if isinstance(mapped, XAIAuthError):
+            LOGGER.error("Invalid API key: %s", mapped)
+            return False
+        raise ConfigEntryNotReady(mapped) from err
+    finally:
+        await close_xai_client(probe)
 
+    client = create_xai_client(api_key)
     entry.runtime_data = client
+    try:
+        tracker = UsageTracker(hass, entry.entry_id)
+        await tracker.async_load()
 
-    tracker = UsageTracker(hass, entry.entry_id)
-    await tracker.async_load()
-
-    # Probe Voice API (TTS/STT) — conversation still works if voice is denied
-    session = async_get_clientsession(hass)
-    voice_ok, voice_detail = await async_validate_voice_access(
-        session, entry.data[CONF_API_KEY]
-    )
-    if voice_ok:
-        LOGGER.info("xAI Voice API OK: %s", voice_detail)
-    else:
-        LOGGER.warning(
-            "xAI Voice API not available for this key — TTS/STT engines "
-            "may fail until voice is enabled on the key. Detail: %s",
-            voice_detail,
+        # Probe Voice API (TTS/STT) — conversation still works if voice is denied
+        session = async_get_clientsession(hass)
+        voice_ok, voice_detail = await async_validate_voice_access(
+            session, entry.data[CONF_API_KEY]
         )
+        if voice_ok:
+            LOGGER.info("xAI Voice API OK: %s", voice_detail)
+        else:
+            LOGGER.warning(
+                "xAI Voice API not available for this key — TTS/STT engines "
+                "may fail until voice is enabled on the key. Detail: %s",
+                voice_detail,
+            )
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "client": client,
-        "usage": tracker,
-        "voice_ok": voice_ok,
-        "voice_detail": voice_detail,
-    }
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+            "client": client,
+            "usage": tracker,
+            "voice_ok": voice_ok,
+            "voice_detail": voice_detail,
+        }
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    except BaseException:
+        await close_xai_client(client)
+        entry.runtime_data = None
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        raise
     return True
 
 
@@ -1011,6 +1005,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Grok."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        client = getattr(entry, "runtime_data", None)
+        if client is not None:
+            await close_xai_client(client)
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unload_ok
 

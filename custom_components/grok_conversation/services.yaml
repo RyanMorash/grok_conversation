@@ -24,7 +24,7 @@ generate_image:
         text:
     aspect_ratio:
       name: "Aspect ratio"
-      description: "Image aspect ratio (omit for xAI auto)"
+      description: "Image aspect ratio (omit for the SDK default)"
       required: false
       selector:
         select:
@@ -42,9 +42,6 @@ generate_image:
             - "20:9"
             - "1:2"
             - "2:1"
-            - "21:9"
-            - "5:2"
-            - "auto"
     resolution:
       name: "Resolution"
       description: "Image resolution (1k default on xAI; 2k available)"
@@ -56,14 +53,13 @@ generate_image:
             - "2k"
     quality:
       name: "Quality"
-      description: "Image quality (low/medium/auto). Only applies to grok-imagine-image-2.0"
+      description: "Image quality (low/medium). Only applies to grok-imagine-image-2.0"
       required: false
       selector:
         select:
           options:
             - "low"
             - "medium"
-            - "auto"
     n:
       name: "Number of images"
       description: "How many images to generate (1–10)"
