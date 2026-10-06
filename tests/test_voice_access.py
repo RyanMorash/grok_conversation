@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import sys
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientError
+import homeassistant.components as ha_components
 from homeassistant.components import conversation
-from homeassistant.components.assist_pipeline.models import Pipeline
-from homeassistant.components.assist_pipeline.runtime import (
+
+# The Assist pipeline package init imports pymicro_vad, which is not installed
+# in this test environment. Register the package path so the store models can
+# load without that audio dependency. A normal Home Assistant install imports
+# the real package before prewarm runs.
+_ASSIST_PKG = "homeassistant.components.assist_pipeline"
+if _ASSIST_PKG not in sys.modules:
+    _assist = types.ModuleType(_ASSIST_PKG)
+    _assist.__path__ = [str(Path(ha_components.__file__).parent / "assist_pipeline")]  # type: ignore[attr-defined]
+    _assist.__package__ = _ASSIST_PKG
+    sys.modules[_ASSIST_PKG] = _assist
+
+from homeassistant.components.assist_pipeline.models import Pipeline  # noqa: E402
+from homeassistant.components.assist_pipeline.runtime import (  # noqa: E402
     KEY_ASSIST_PIPELINE,
     AssistDevice,
 )
