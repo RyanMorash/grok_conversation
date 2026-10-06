@@ -81,6 +81,40 @@ def test_search_phrases_use_word_boundaries() -> None:
     assert not should_use_live_search(
         "set the thermostat to 72", interaction_mode="tools", live_search="full"
     )
+    assert looks_like_search_query("headlines")
+    assert looks_like_search_query("what are the scores")
+    assert looks_like_search_query("stocks today")
+    assert not looks_like_search_query("scoreboard")
+    assert looks_like_device_command("please turn on the lights today")
+    assert looks_like_device_command("can you please turn on the lights today")
+    assert not should_use_live_search(
+        "please turn on the lights today",
+        interaction_mode="tools",
+        live_search="full",
+    )
+    assert not should_use_live_search(
+        "please turn on the lights today",
+        interaction_mode="chat_only",
+        live_search="web",
+    )
+    assert not should_use_live_search(
+        "please turn on the lights today",
+        interaction_mode="pipeline",
+        live_search="web",
+    )
+    assert not looks_like_device_command("open restaurants near me")
+    assert looks_like_search_query("open restaurants near me")
+    assert should_use_live_search(
+        "open restaurants near me", interaction_mode="tools", live_search="web"
+    )
+    assert should_use_live_search(
+        "open restaurants near me", interaction_mode="chat_only", live_search="web"
+    )
+    assert should_use_live_search(
+        "open restaurants near me", interaction_mode="pipeline", live_search="web"
+    )
+    assert looks_like_device_command("open the garage")
+    assert looks_like_device_command("close the blinds")
 
 
 def test_vision_model_detection() -> None:

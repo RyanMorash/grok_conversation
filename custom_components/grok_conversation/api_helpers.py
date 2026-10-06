@@ -706,6 +706,7 @@ _SEARCH_PHRASES: tuple[str, ...] = (
     "latest",
     "news",
     "headline",
+    "headlines",
     "today",
     "tonight",
     "tomorrow",
@@ -714,7 +715,9 @@ _SEARCH_PHRASES: tuple[str, ...] = (
     "final score",
     "box score",
     "score",
+    "scores",
     "stock",
+    "stocks",
     "price of",
     "weather",
     "forecast",
@@ -748,6 +751,9 @@ _SEARCH_QUERY = re.compile(
     re.IGNORECASE,
 )
 
+# Verbs that start a device command even when the sentence also has a
+# lookup word such as "today". "open" and "close" are not in this list:
+# "open restaurants near me" is a lookup.
 _DEVICE_PREFIXES: tuple[str, ...] = (
     "turn ",
     "set ",
@@ -756,8 +762,6 @@ _DEVICE_PREFIXES: tuple[str, ...] = (
     "unlock ",
     "pause ",
     "stop ",
-    "open ",
-    "close ",
     "switch ",
     "dim ",
     "brighten ",
@@ -766,10 +770,29 @@ _DEVICE_PREFIXES: tuple[str, ...] = (
     "toggle ",
 )
 
+_REQUEST_PREFIX = re.compile(
+    r"^(?:(?:please|can you|could you|would you|will you|hey|ok|okay)\b[, ]*)+",
+    re.IGNORECASE,
+)
+
 _DEVICE_LIGHT = re.compile(
     r"\b(?:lights? on|lights? off)\b",
     re.IGNORECASE,
 )
+
+# Home targets for the ambiguous verbs "open" and "close".
+_OPEN_CLOSE_TARGET = re.compile(
+    r"\b(?:doors?|garages?|blinds?|shades?|covers?|curtains?|gates?|windows?|"
+    r"locks?|lights?|lamps?|fans?|valves?|switches?|tvs?|televisions?|"
+    r"speakers?|thermostats?|outlets?|plugs?)\b",
+    re.IGNORECASE,
+)
+
+
+def _command_text(text: str) -> str:
+    """Drop a leading politeness phrase so the verb can be recognized."""
+    stripped = _REQUEST_PREFIX.sub("", (text or "").strip())
+    return stripped.strip().lower()
 
 
 def looks_like_search_query(text: str) -> bool:
@@ -779,11 +802,13 @@ def looks_like_search_query(text: str) -> bool:
 
 def looks_like_device_command(text: str) -> bool:
     """Return True for ordinary device commands, not web lookups."""
-    t = (text or "").strip().lower()
+    t = _command_text(text)
     if not t:
         return False
     if any(t.startswith(prefix) for prefix in _DEVICE_PREFIXES):
         return True
+    if t.startswith(("open ", "close ")):
+        return _OPEN_CLOSE_TARGET.search(t) is not None
     return _DEVICE_LIGHT.search(t) is not None
 
 
