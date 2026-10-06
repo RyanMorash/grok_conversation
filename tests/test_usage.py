@@ -27,7 +27,8 @@ from custom_components.grok_conversation.usage import (
 
 def test_usage_sensors_use_total_state_class() -> None:
     """Cleared totals need TOTAL plus last_reset, not TOTAL_INCREASING."""
-    assert GrokUsageSensor._attr_state_class is SensorStateClass.TOTAL
+    # SensorEntity wraps _attr_state_class in a cached property.
+    assert GrokUsageSensor.__dict__["_attr_state_class"] is SensorStateClass.TOTAL
 
 
 def test_model_price_table_and_imagine_estimate() -> None:
@@ -102,6 +103,7 @@ async def test_budget_warning_fires_on_cross_then_cooldown(
         completion_tokens=0,
         budget_warn_usd=1.0,
     )
+    await hass.async_block_till_done()
     assert len(events) == 1
     assert events[0] == 1.25
 
@@ -114,6 +116,7 @@ async def test_budget_warning_fires_on_cross_then_cooldown(
         completion_tokens=0,
         budget_warn_usd=1.0,
     )
+    await hass.async_block_till_done()
     assert len(events) == 2
 
 
