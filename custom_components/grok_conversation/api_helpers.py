@@ -498,14 +498,63 @@ def chat_result_from_response(response: Any) -> ChatResult:
     )
 
 
+# Models that rejected reasoning_effort. Logged once, then omitted.
+_REASONING_EFFORT_REJECTED: set[str] = set()
+
+
+def _model_sends_reasoning_effort(model: str) -> bool:
+    """Return True when this id should receive reasoning_effort."""
+    if model in _REASONING_EFFORT_REJECTED:
+        return False
+    lowered = model.lower()
+    if "reasoning" in lowered:
+        return True
+    # grok-4.3 supports effort but the id does not contain "reasoning".
+    return lowered == "grok-4.3" or lowered.startswith("grok-4.3-")
+
+
 def _maybe_reasoning_effort(model: str, reasoning_effort: str | None) -> str | None:
-    if (
-        reasoning_effort
-        and reasoning_effort != "none"
-        and "reasoning" in model.lower()
-    ):
-        return reasoning_effort
-    return None
+    if not reasoning_effort or reasoning_effort == "none":
+        return None
+    if not _model_sends_reasoning_effort(model):
+        return None
+    return reasoning_effort
+
+
+def _reasoning_effort_rejected(err: BaseException) -> bool:
+    """Return True when the API refused the reasoning_effort field."""
+    text = str(err).lower().replace("_", " ")
+    return "reasoning effort" in text
+
+
+def _drop_reasoning_effort(model: str) -> None:
+    """Stop sending reasoning_effort for this id, and log that once."""
+    if model in _REASONING_EFFORT_REJECTED:
+        return
+    _REASONING_EFFORT_REJECTED.add(model)
+    LOGGER.warning(
+        "Model '%s' rejected reasoning_effort; omitting it for this id",
+        model,
+    )
+
+
+async def _sample_chat(client: Any, kwargs: dict[str, Any]) -> Any:
+    """Create a chat and sample it, retrying once if effort is rejected."""
+    model = str(kwargs.get("model") or "")
+    try:
+        chat = client.chat.create(**kwargs)
+        return await chat.sample()
+    except Exception as err:  # noqa: BLE001
+        mapped = map_xai_error(err)
+        if not (kwargs.get("reasoning_effort") and _reasoning_effort_rejected(mapped)):
+            raise mapped from err
+        _drop_reasoning_effort(model)
+        retry = {key: value for key, value in kwargs.items() if key != "reasoning_effort"}
+        try:
+            chat = client.chat.create(**retry)
+            return await chat.sample()
+        except Exception as retry_err:  # noqa: BLE001
+            raise map_xai_error(retry_err) from retry_err
 
 
 def _chat_create_kwargs(
@@ -586,11 +635,7 @@ async def async_chat_completion(
         response_format=response_format,
         search_parameters=search_parameters,
     )
-    try:
-        chat = client.chat.create(**kwargs)
-        response = await chat.sample()
-    except Exception as err:  # noqa: BLE001
-        raise map_xai_error(err) from err
+    response = await _sample_chat(client, kwargs)
     return chat_result_from_response(response)
 
 
@@ -623,12 +668,48 @@ async def async_chat_stream(
         response_format=response_format,
         search_parameters=search_parameters,
     )
+    yielded = False
+
+    async def _open(request: dict[str, Any]) -> Any:
+        try:
+            return client.chat.create(**request)
+        except Exception as err:  # noqa: BLE001
+            raise map_xai_error(err) from err
+
     try:
-        chat = client.chat.create(**kwargs)
+        chat = await _open(kwargs)
+    except Exception as err:  # noqa: BLE001
+        mapped = map_xai_error(err) if not isinstance(err, XAIError) else err
+        if not (kwargs.get("reasoning_effort") and _reasoning_effort_rejected(mapped)):
+            raise mapped from err
+        _drop_reasoning_effort(str(kwargs.get("model") or ""))
+        kwargs = {
+            key: value for key, value in kwargs.items() if key != "reasoning_effort"
+        }
+        chat = await _open(kwargs)
+
+    try:
         async for response, chunk in chat.stream():
+            yielded = True
             yield response, chunk
     except Exception as err:  # noqa: BLE001
-        raise map_xai_error(err) from err
+        mapped = map_xai_error(err)
+        if (
+            yielded
+            or not kwargs.get("reasoning_effort")
+            or not _reasoning_effort_rejected(mapped)
+        ):
+            raise mapped from err
+        _drop_reasoning_effort(str(kwargs.get("model") or ""))
+        retry = {
+            key: value for key, value in kwargs.items() if key != "reasoning_effort"
+        }
+        try:
+            chat = await _open(retry)
+            async for response, chunk in chat.stream():
+                yield response, chunk
+        except Exception as retry_err:  # noqa: BLE001
+            raise map_xai_error(retry_err) from retry_err
 
 
 async def async_responses_completion(
