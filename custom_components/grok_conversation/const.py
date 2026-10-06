@@ -241,6 +241,14 @@ def prompt_for_interaction(mode: str | None, stored: str | None) -> str | None:
     return GROK_CHAT_ONLY_PROMPT
 
 
+def active_llm_api_ids(stored: object) -> list[str]:
+    """Return stored LLM API ids, ignoring an explicit No control opt-out."""
+    if not stored:
+        return []
+    values = stored if isinstance(stored, list) else [stored]
+    return [str(api_id) for api_id in values if api_id and str(api_id) != "none"]
+
+
 def pick_default_llm_api(apis: list) -> str | None:
     """Pick the Assist LLM API id to store for tool control.
 

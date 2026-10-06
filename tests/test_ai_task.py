@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import voluptuous as vol
 from homeassistant.components import ai_task
-from homeassistant.const import CONF_API_KEY, CONF_LLM_HASS_API
+from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er, selector
@@ -146,10 +146,7 @@ async def test_migrate_adds_ai_task_subentry(
     assert any(
         s.subentry_type == "ai_task_data" for s in entry.subentries.values()
     )
-    assert dict(entry.options) == {
-        **options_before,
-        CONF_LLM_HASS_API: ["assist"],
-    }
+    assert dict(entry.options) == options_before
     assert (
         registry.async_get_entity_id("conversation", DOMAIN, entry.entry_id)
         == conv_before

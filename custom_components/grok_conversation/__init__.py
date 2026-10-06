@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
-from homeassistant.const import CONF_API_KEY, CONF_LLM_HASS_API, Platform
+from homeassistant.const import CONF_API_KEY, Platform
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -24,7 +24,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
-from homeassistant.helpers import config_validation as cv, llm, selector
+from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
@@ -39,14 +39,12 @@ from .api_helpers import (
     create_xai_client,
     map_xai_error,
 )
-from .config_flow import pick_default_llm_api
 from .const import (
     CONF_CHAT_MODEL,
     CONF_FALLBACK_MODEL,
     CONF_FAST_MODEL,
     CONF_FILENAMES,
     CONF_IMAGE_MODEL,
-    CONF_INTERACTION_MODE,
     CONF_LIVE_SEARCH,
     CONF_LOCATION_CONTEXT,
     CONF_MAX_TOKENS,
@@ -64,7 +62,6 @@ from .const import (
     IMAGE_RESPONSE_FORMATS,
     LIVE_SEARCH_OFF,
     LOGGER,
-    MODE_TOOLS,
     RECOMMENDED_AI_TASK_OPTIONS,
     RECOMMENDED_CHAT_MODEL,
     RECOMMENDED_FALLBACK_MODEL,
@@ -1103,24 +1100,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.config_entries.async_update_entry(entry, **update_kwargs)
 
     if entry.version == 1 and entry.minor_version < 4:
-        options = dict(entry.options)
-        update_kwargs = {"minor_version": 4}
-        # Only tool-mode entries that never stored an API. chat_only and
-        # pipeline stay as configured, and a cleared API is not put back.
-        if (
-            options.get(CONF_INTERACTION_MODE) == MODE_TOOLS
-            and not options.get(CONF_LLM_HASS_API)
-        ):
-            api_id = pick_default_llm_api(llm.async_get_apis(hass))
-            if api_id:
-                options[CONF_LLM_HASS_API] = [api_id]
-                update_kwargs["options"] = options
-                LOGGER.info(
-                    "Stored Assist LLM API '%s' for entry %s",
-                    api_id,
-                    entry.entry_id,
-                )
-        hass.config_entries.async_update_entry(entry, **update_kwargs)
+        # "No control" removed CONF_LLM_HASS_API, so a missing key is also an
+        # opt-out. Do not restore Assist. New entries still store the API at
+        # creation, and an explicit ["none"] opt-out is left as stored.
+        hass.config_entries.async_update_entry(entry, minor_version=4)
 
     LOGGER.debug(
         "Migration to version %s.%s successful",

@@ -56,6 +56,7 @@ from .const import (
     RECOMMENDED_TOP_P,
     RECOMMENDED_VOICE_OPTIMIZED,
     VOICE_OPTIMIZED_SUFFIX,
+    active_llm_api_ids,
     prompt_for_interaction,
     remap_retired_chat_model,
 )
@@ -118,13 +119,8 @@ class OpenAIConversationEntity(
         mode = self.entry.options.get(
             CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
         )
-        llm_hass_api = self.entry.options.get(CONF_LLM_HASS_API)
-        if mode == MODE_CHAT_ONLY or not llm_hass_api:
-            self._attr_supported_features = conversation.ConversationEntityFeature(0)
-            return
-        api_ids = llm_hass_api if isinstance(llm_hass_api, list) else [llm_hass_api]
-        api_ids = [api_id for api_id in api_ids if api_id != "none"]
-        if not api_ids:
+        api_ids = active_llm_api_ids(self.entry.options.get(CONF_LLM_HASS_API))
+        if mode == MODE_CHAT_ONLY or not api_ids:
             self._attr_supported_features = conversation.ConversationEntityFeature(0)
             return
         try:
@@ -452,7 +448,11 @@ class OpenAIConversationEntity(
                 return piped
 
         # Chat-only: disable LLM HASS API tools
-        llm_api_option = None if mode == MODE_CHAT_ONLY else options.get(CONF_LLM_HASS_API)
+        llm_api_option = (
+            None
+            if mode == MODE_CHAT_ONLY
+            else active_llm_api_ids(options.get(CONF_LLM_HASS_API)) or None
+        )
 
         extra = self._build_extra_system_prompt(user_input)
         user_extra = user_input.extra_system_prompt or ""

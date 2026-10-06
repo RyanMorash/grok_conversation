@@ -351,7 +351,8 @@ class OpenAIOptionsFlow(OptionsFlow):
                             api_list.append(a)
 
                     if not api_list:
-                        user_input.pop(CONF_LLM_HASS_API, None)
+                        # Persist No control. Dropping the key looks like "never set".
+                        user_input[CONF_LLM_HASS_API] = ["none"]
                     else:
                         invalid_apis = [
                             api_id
@@ -380,7 +381,8 @@ class OpenAIOptionsFlow(OptionsFlow):
                         else:
                             user_input[CONF_LLM_HASS_API] = api_list
                 else:
-                    user_input.pop(CONF_LLM_HASS_API, None)
+                    if CONF_LLM_HASS_API in user_input:
+                        user_input[CONF_LLM_HASS_API] = ["none"]
 
                 # Validate model picks (allow custom values that look chat-capable)
                 for model_key in (CONF_CHAT_MODEL, CONF_FAST_MODEL, CONF_FALLBACK_MODEL):

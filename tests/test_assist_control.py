@@ -142,9 +142,8 @@ async def test_user_flow_without_apis_leaves_llm_unset(hass: HomeAssistant) -> N
     assert CONF_LLM_HASS_API not in result["result"].options
 
 
-async def test_migration_sets_assist_api_for_tools_only(hass: HomeAssistant) -> None:
-    """Existing tool-mode entries gain an API; chat-only and pipeline do not."""
-    tools = _entry(dict(RECOMMENDED_OPTIONS))
+async def test_migration_leaves_other_modes_and_stored_apis(hass: HomeAssistant) -> None:
+    """Migration keeps chat-only, pipeline, and an API the user already stored."""
     chat_only = _entry(
         {
             **dict(RECOMMENDED_OPTIONS),
@@ -163,16 +162,73 @@ async def test_migration_sets_assist_api_for_tools_only(hass: HomeAssistant) -> 
             CONF_LLM_HASS_API: ["calendar"],
         }
     )
-    for entry in (tools, chat_only, pipeline, already):
+    for entry in (chat_only, pipeline, already):
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    assert tools.minor_version == 4
-    assert tools.options[CONF_LLM_HASS_API] == ["assist"]
+    assert chat_only.minor_version == 4
+    assert pipeline.minor_version == 4
+    assert already.minor_version == 4
     assert CONF_LLM_HASS_API not in chat_only.options
     assert CONF_LLM_HASS_API not in pipeline.options
     assert already.options[CONF_LLM_HASS_API] == ["calendar"]
+
+
+async def test_pre_v4_cleared_tools_entry_is_not_restored(hass: HomeAssistant) -> None:
+    """No control on a pre-v4 tools entry has no API and must stay cleared."""
+    entry = _entry(
+        {
+            **dict(RECOMMENDED_OPTIONS),
+            CONF_INTERACTION_MODE: MODE_TOOLS,
+        },
+        minor_version=3,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.minor_version == 4
+    assert CONF_LLM_HASS_API not in entry.options
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+    assert agent is not None
+    assert not (
+        agent.supported_features & conversation.ConversationEntityFeature.CONTROL
+    )
+
+
+async def test_no_control_is_stored_as_explicit_opt_out(hass: HomeAssistant) -> None:
+    """Selecting No control keeps an explicit opt-out instead of deleting the key."""
+    entry = _entry(
+        {
+            **dict(RECOMMENDED_OPTIONS),
+            CONF_INTERACTION_MODE: MODE_TOOLS,
+            CONF_LLM_HASS_API: ["assist"],
+        },
+        minor_version=4,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == FlowResultType.FORM
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "recommended": True,
+            CONF_LLM_HASS_API: ["none"],
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_LLM_HASS_API] == ["none"]
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+    assert agent is not None
+    assert not (
+        agent.supported_features & conversation.ConversationEntityFeature.CONTROL
+    )
 
 
 async def test_current_tools_entry_without_api_is_not_backfilled(
