@@ -209,7 +209,7 @@ async def test_setup_closes_runtime_client_on_later_failure(
         data={CONF_API_KEY: "test-key"},
         options=dict(RECOMMENDED_OPTIONS),
         version=1,
-        minor_version=3,
+        minor_version=4,
     )
     entry.add_to_hass(hass)
     with (
@@ -239,7 +239,7 @@ async def test_setup_closes_probe_on_cancellation(hass: HomeAssistant) -> None:
         data={CONF_API_KEY: "test-key"},
         options=dict(RECOMMENDED_OPTIONS),
         version=1,
-        minor_version=3,
+        minor_version=4,
     )
     with patch(
         "custom_components.grok_conversation.create_xai_client",

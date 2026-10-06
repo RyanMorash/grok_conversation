@@ -215,6 +215,66 @@ Critical rules for smart home control and sensors:
 - Keep spoken Assist replies concise (1-3 sentences) unless the user asks for detail.
 """
 
+# Chat-only must not keep the stock prompt, which tells the model to call tools.
+GROK_CHAT_ONLY_PROMPT = """
+You are Grok, a helpful and maximally truthful AI built by xAI.
+
+Critical rules:
+- You are in chat-only mode. Do not call tools and do not claim you can control devices.
+- NEVER invent device states, temperatures, weather, or claim an action succeeded.
+- For current events, news, sports, stocks, or web/X info: use live search when enabled; otherwise say you lack live data.
+- For general knowledge (history, science, definitions): answer from training data.
+- Keep spoken Assist replies concise (1-3 sentences) unless the user asks for detail.
+"""
+
+
+def prompt_for_interaction(mode: str | None, stored: str | None) -> str | None:
+    """Return the prompt to send for this interaction mode.
+
+    Chat-only replaces the stock tool prompt so the model is not told to call
+    Home Assistant tools. A user-edited prompt is returned unchanged.
+    """
+    if mode != MODE_CHAT_ONLY or not isinstance(stored, str):
+        return stored
+    if stored.strip() != GROK_SYSTEM_PROMPT.strip():
+        return stored
+    return GROK_CHAT_ONLY_PROMPT
+
+
+def pick_default_llm_api(apis: list) -> str | None:
+    """Pick the Assist LLM API id to store for tool control.
+
+    Prefer an id or name containing ``assist``, then ``homeassistant``,
+    otherwise the first registered API. ``homeassistant`` itself contains
+    the letters "assist", so that id is only used in the second pass.
+    """
+    if not apis:
+        return None
+
+    def _text(api: object, attr: str) -> str:
+        return str(getattr(api, attr, "") or "").lower()
+
+    def _is_homeassistant(api: object) -> bool:
+        ident = _text(api, "id")
+        name = _text(api, "name").replace(" ", "")
+        return "homeassistant" in ident or "homeassistant" in name
+
+    def _ident(api: object) -> str | None:
+        ident = getattr(api, "id", None)
+        return str(ident) if ident else None
+
+    for api in apis:
+        if _is_homeassistant(api):
+            continue
+        if "assist" in _text(api, "id") or "assist" in _text(api, "name"):
+            if ident := _ident(api):
+                return ident
+    for api in apis:
+        if _is_homeassistant(api) and (ident := _ident(api)):
+            return ident
+    return _ident(apis[0])
+
+
 VOICE_OPTIMIZED_SUFFIX = (
     "\nYou are responding through a voice assistant. "
     "Keep answers short (1-3 sentences) unless the user asks for detail. "
