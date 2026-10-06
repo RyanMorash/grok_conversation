@@ -553,24 +553,10 @@ class GrokBaseLLMEntity(Entity):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 service=service,
+                budget_warn_usd=float(
+                    self.entry.options.get(CONF_BUDGET_WARN_USD, 0) or 0
+                ),
             )
-            budget = float(
-                self.entry.options.get(CONF_BUDGET_WARN_USD, 0) or 0
-            )
-            if budget > 0 and tracker.snapshot.estimated_cost_usd >= budget:
-                LOGGER.warning(
-                    "Grok estimated spend $%.4f exceeded budget warn $%.2f",
-                    tracker.snapshot.estimated_cost_usd,
-                    budget,
-                )
-                self.hass.bus.async_fire(
-                    f"{DOMAIN}_budget_warning",
-                    {
-                        "entry_id": self.entry.entry_id,
-                        "estimated_cost_usd": tracker.snapshot.estimated_cost_usd,
-                        "budget_warn_usd": budget,
-                    },
-                )
 
     async def _async_prepare_attachment_parts(
         self,

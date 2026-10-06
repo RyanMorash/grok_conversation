@@ -41,6 +41,7 @@ from .api_helpers import (
     map_xai_error,
 )
 from .const import (
+    CONF_BUDGET_WARN_USD,
     CONF_CHAT_MODEL,
     CONF_FALLBACK_MODEL,
     CONF_FAST_MODEL,
@@ -85,7 +86,7 @@ from .const import (
     remap_retired_chat_model,
 )
 from .entity import resolve_vision_model
-from .usage import UsageTracker
+from .usage import UsageTracker, imagine_estimate_usd
 from .voice_api import async_validate_voice_access
 
 PLATFORMS = (
@@ -395,15 +396,23 @@ async def _record_usage(
     prompt_tokens: int,
     completion_tokens: int,
     service: str,
+    extra_cost_usd: float = 0.0,
 ) -> None:
     tracker = _usage_tracker(hass, entry_id)
-    if tracker:
-        await tracker.async_record(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            service=service,
-        )
+    if not tracker:
+        return
+    entry = hass.config_entries.async_get_entry(entry_id)
+    budget = 0.0
+    if entry is not None:
+        budget = float(entry.options.get(CONF_BUDGET_WARN_USD, 0) or 0)
+    await tracker.async_record(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        service=service,
+        extra_cost_usd=extra_cost_usd,
+        budget_warn_usd=budget,
+    )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -435,6 +444,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             prompt_tokens=0,
             completion_tokens=0,
             service="generate_image",
+            extra_cost_usd=imagine_estimate_usd(
+                str(model), int(call.data.get("n") or 1)
+            ),
         )
         return result
 
@@ -1073,7 +1085,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         client = getattr(entry, "runtime_data", None)
         if client is not None:
             await close_xai_client(client)
-        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        tracker = data.get("usage") if isinstance(data, dict) else None
+        if tracker is not None:
+            await tracker.async_flush()
     return unload_ok
 
 
