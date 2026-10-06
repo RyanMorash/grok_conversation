@@ -3,7 +3,9 @@
 import pytest
 
 from custom_components.grok_conversation.api_helpers import (
+    looks_like_device_command,
     looks_like_non_search_query,
+    looks_like_search_query,
     should_use_live_search,
 )
 from custom_components.grok_conversation.const import (
@@ -47,13 +49,37 @@ def test_tools_mode_allow_list_only() -> None:
     )
 
 
-def test_chat_only_always_searches_when_enabled() -> None:
-    """Chat-only always uses live search when enabled."""
+def test_chat_only_searches_only_on_allow_list() -> None:
+    """Chat-only searches real lookups, not every utterance."""
     assert should_use_live_search(
+        "latest news", interaction_mode="chat_only", live_search="web"
+    )
+    assert not should_use_live_search(
         "anything at all", interaction_mode="chat_only", live_search="web"
     )
     assert not should_use_live_search(
         "anything", interaction_mode="chat_only", live_search="off"
+    )
+
+
+def test_search_phrases_use_word_boundaries() -> None:
+    """Substrings inside ordinary words and device names are not lookups."""
+    assert looks_like_search_query("what's trending on x")
+    assert looks_like_search_query("what's the weather today")
+    assert not looks_like_search_query("turn on xbox")
+    assert not looks_like_search_query("I am currently reading")
+    assert looks_like_device_command("turn on xbox")
+    assert not should_use_live_search(
+        "turn on xbox", interaction_mode="tools", live_search="full"
+    )
+    assert not should_use_live_search(
+        "turn on xbox", interaction_mode="chat_only", live_search="web"
+    )
+    assert not should_use_live_search(
+        "turn on the lights today", interaction_mode="pipeline", live_search="web"
+    )
+    assert not should_use_live_search(
+        "set the thermostat to 72", interaction_mode="tools", live_search="full"
     )
 
 
