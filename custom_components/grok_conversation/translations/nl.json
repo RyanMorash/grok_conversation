@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "xAI is nu bezet. Probeer het zo opnieuw."
+    },
+    "auth_failed": {
+      "message": "De xAI API-sleutel is geweigerd. Werk hem bij in de instellingen."
+    },
+    "token_length": {
+      "message": "Dat antwoord is afgekapt. Verhoog de tokenlimiet en probeer het opnieuw."
+    }
   }
 }

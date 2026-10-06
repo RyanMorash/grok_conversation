@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "Az xAI most túlterhelt. Próbáld meg újra egy pillanat múlva."
+    },
+    "auth_failed": {
+      "message": "Az xAI API-kulcsot elutasították. Frissítsd a beállításokban."
+    },
+    "token_length": {
+      "message": "A válasz megszakadt. Növeld a tokenlimitet, és próbáld újra."
+    }
   }
 }

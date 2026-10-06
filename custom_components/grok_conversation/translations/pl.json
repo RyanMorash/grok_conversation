@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "xAI jest teraz zajęty. Spróbuj ponownie za chwilę."
+    },
+    "auth_failed": {
+      "message": "Klucz API xAI został odrzucony. Zaktualizuj go w ustawieniach."
+    },
+    "token_length": {
+      "message": "Odpowiedź została ucięta. Zwiększ limit tokenów i spróbuj ponownie."
+    }
   }
 }

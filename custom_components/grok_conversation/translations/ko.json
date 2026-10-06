@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "xAI가 지금 바쁩니다. 잠시 후 다시 시도하세요."
+    },
+    "auth_failed": {
+      "message": "xAI API 키가 거부되었습니다. 설정에서 키를 업데이트하세요."
+    },
+    "token_length": {
+      "message": "답변이 잘렸습니다. 토큰 한도를 늘린 뒤 다시 시도하세요."
+    }
   }
 }
