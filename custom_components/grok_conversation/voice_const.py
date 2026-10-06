@@ -13,6 +13,9 @@ CONF_STT_FORMAT = "stt_format"
 CONF_ENABLE_TTS = "enable_tts"
 CONF_ENABLE_STT = "enable_stt"
 CONF_VOICE_API_OK = "voice_api_ok"
+# Cached voices-list result stored on the config entry. Not a TTS sample.
+CONF_VOICE_ACCESS = "voice_access"
+CONF_RECHECK_VOICE = "recheck_voice_access"
 
 RECOMMENDED_TTS_VOICE = "eve"
 RECOMMENDED_TTS_LANGUAGE = "en"

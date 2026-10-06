@@ -475,24 +475,70 @@ class OpenAIConversationEntity(
     # Long spoken replies without prewarmed TTS: don't open the mic early (#31)
     _SATELLITE_LONG_REPLY_CHARS = 280
 
+    def _assist_pipeline_for_device(self, device_id: str | None) -> Any | None:
+        """Return the Assist pipeline registered for this satellite.
+
+        A device that is not in the pipeline registry is skipped. A registered
+        device that chose the preferred pipeline uses that preferred pipeline.
+        """
+        if not device_id:
+            return None
+        try:
+            from homeassistant.components.assist_pipeline.runtime import (
+                KEY_ASSIST_PIPELINE,
+            )
+            from homeassistant.components.assist_pipeline.select import (
+                get_chosen_pipeline,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Assist pipeline imports unavailable", exc_info=True)
+            return None
+
+        pipeline_data = self.hass.data.get(KEY_ASSIST_PIPELINE)
+        if pipeline_data is None:
+            return None
+        device = pipeline_data.pipeline_devices.get(device_id)
+        if device is None:
+            return None
+        try:
+            pipeline_id = get_chosen_pipeline(
+                self.hass, device.domain, device.unique_id_prefix
+            )
+            if pipeline_id is None:
+                pipeline_id = pipeline_data.pipeline_store.async_get_preferred_item()
+            if not pipeline_id:
+                return None
+            return pipeline_data.pipeline_store.data.get(pipeline_id)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug(
+                "Could not resolve Assist pipeline for device_id=%s",
+                device_id,
+                exc_info=True,
+            )
+            return None
+
     async def _prewarm_pipeline_tts(
         self,
         message: str,
         user_input: conversation.ConversationInput,
     ) -> bool:
-        """Pre-generate Assist pipeline TTS so satellite playback can start ASAP.
+        """Pre-generate TTS for the satellite's own Assist pipeline.
 
-        Reads engine/language/voice from the preferred Assist pipeline — not a
-        hardcoded voice. Populates the TTS cache used by the next pipeline TTS.
+        Uses the engine, language, and voice of the pipeline registered for
+        ``user_input.device_id``. An unresolved device skips prewarm.
         """
         try:
-            from homeassistant.components import assist_pipeline, tts
+            from homeassistant.components import tts
             from homeassistant.components.tts.media_source import (
                 generate_media_source_id,
             )
 
-            pipeline = assist_pipeline.async_get_pipeline(self.hass)
-            if not pipeline or not pipeline.tts_engine:
+            pipeline = self._assist_pipeline_for_device(user_input.device_id)
+            if pipeline is None or not pipeline.tts_engine:
+                LOGGER.debug(
+                    "Skipping TTS prewarm; no Assist pipeline for device_id=%s",
+                    user_input.device_id,
+                )
                 return False
 
             options: dict[str, Any] = {}

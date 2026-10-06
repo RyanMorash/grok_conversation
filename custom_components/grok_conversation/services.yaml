@@ -344,7 +344,7 @@ query_image:
 
 clear_memory:
   name: "Clear memory"
-  description: "Reload the integration to reset in-memory conversation agent state"
+  description: "Leave the config entry loaded. Home Assistant owns chat history."
   fields:
     config_entry:
       name: "Config Entry"
@@ -432,3 +432,14 @@ home_briefing:
               value: "x"
             - label: "Full (Web + X)"
               value: "full"
+
+recheck_voice:
+  name: "Recheck Voice access"
+  description: "Probe the xAI voices list again and update the stored result."
+  fields:
+    config_entry:
+      name: "Config Entry"
+      required: true
+      selector:
+        config_entry:
+          integration: grok_conversation

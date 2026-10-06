@@ -57,60 +57,54 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
     return header + pcm
 
 
+def _voices_list_usable(data: Any) -> bool:
+    """Return True when the voices payload contains at least one voice id."""
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        raw = data.get("voices") or data.get("data") or []
+        items = raw if isinstance(raw, list) else []
+    else:
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("voice_id") or item.get("id") or item.get("name"):
+            return True
+    return False
+
+
 async def async_validate_voice_access(
     session: ClientSession, api_key: str
 ) -> tuple[bool, str]:
-    """
-    Check whether the API key can use xAI voice endpoints.
+    """Check whether the API key can use xAI voice endpoints.
 
-    Returns (ok, detail_message).
+    Uses the voices list only. A missing or unusable list does not synthesize
+    speech. Returns (ok, detail_message).
     """
     headers = {"Authorization": f"Bearer {api_key}"}
-    # Prefer lightweight voices list if available
     try:
         async with session.get(
             XAI_VOICES_URL, headers=headers, timeout=_TIMEOUT_SHORT
         ) as resp:
-            if resp.status == 200:
-                return True, "Voice API accessible (voices list OK)"
             if resp.status in (401, 403):
                 text = await resp.text()
-                return False, f"API key rejected for voice ({resp.status}): {text[:200]}"
-            # 404 = endpoint path differs; fall through to TTS probe
-            _LOGGER.debug("Voices list returned %s, probing TTS", resp.status)
-    except ClientError as err:
-        _LOGGER.debug("Voices list failed: %s", err)
-
-    # Tiny TTS probe
-    try:
-        async with session.post(
-            XAI_TTS_URL,
-            headers={**headers, "Content-Type": "application/json"},
-            json={
-                "text": "Hi",
-                "voice_id": "eve",
-                "language": "en",
-                "output_format": {
-                    "codec": "mp3",
-                    "sample_rate": 24000,
-                    "bit_rate": 64000,
-                },
-            },
-            timeout=_TIMEOUT_TTS,
-        ) as resp:
-            if resp.status == 200:
-                return True, "Voice API accessible (TTS probe OK)"
-            text = await resp.text()
-            if resp.status in (401, 403):
                 return (
                     False,
-                    "This API key cannot access xAI Voice (TTS/STT). "
-                    "Enable Voice in the xAI console or create a key with voice permissions. "
-                    f"({resp.status})",
+                    f"API key rejected for voice ({resp.status}): {text[:200]}",
                 )
-            return False, f"Voice probe failed ({resp.status}): {text[:240]}"
-    except ClientError as err:
+            if resp.status != 200:
+                return False, f"Voices list was not usable ({resp.status})"
+            try:
+                data = await resp.json(content_type=None)
+            except (ClientError, ValueError, TypeError):
+                return False, "Voices list was not usable"
+    except (ClientError, TimeoutError) as err:
         return False, f"Could not reach xAI Voice API: {err}"
+
+    if _voices_list_usable(data):
+        return True, "Voice API accessible (voices list OK)"
+    return False, "Voices list was not usable"
 
 
 async def async_list_voices(

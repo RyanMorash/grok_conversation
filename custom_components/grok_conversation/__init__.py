@@ -25,7 +25,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
-from homeassistant.helpers import config_validation as cv, selector
+from homeassistant.helpers import config_validation as cv, issue_registry as ir, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
@@ -82,12 +82,14 @@ from .const import (
     SERVICE_HOME_BRIEFING,
     SERVICE_PHOTO_ANALYSIS,
     SERVICE_QUERY_IMAGE,
+    SERVICE_RECHECK_VOICE,
     SERVICE_RESET_STATS,
     remap_retired_chat_model,
 )
 from .entity import resolve_vision_model
 from .usage import UsageTracker, imagine_estimate_usd
 from .voice_api import async_validate_voice_access
+from .voice_const import CONF_VOICE_ACCESS
 
 PLATFORMS = (
     Platform.AI_TASK,
@@ -379,6 +381,63 @@ def _validate_config_entry(hass: HomeAssistant, entry_id: str) -> GrokConfigEntr
 
 def _entry_client(entry: GrokConfigEntry) -> Any:
     return entry.runtime_data
+
+
+def _voice_access_cache(entry: ConfigEntry) -> dict[str, Any] | None:
+    """Return the stored voices-list result, if this entry has one."""
+    cached = entry.data.get(CONF_VOICE_ACCESS)
+    if isinstance(cached, dict) and "ok" in cached:
+        return cached
+    return None
+
+
+def async_publish_voice_repair(
+    hass: HomeAssistant, entry: ConfigEntry, voice_ok: bool, detail: str
+) -> None:
+    """Raise a repair when the key can chat but cannot use Voice.
+
+    A reachability failure is not a chat-only key. Leave an existing repair
+    in place until a probe says Voice works or the voices list is unusable.
+    """
+    issue_id = f"voice_chat_only_{entry.entry_id}"
+    if voice_ok:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+    if detail.startswith("Could not reach"):
+        return
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="voice_chat_only",
+        translation_placeholders={"detail": detail[:180]},
+        data={"entry_id": entry.entry_id},
+    )
+
+
+async def async_recheck_voice_access(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> tuple[bool, str]:
+    """Probe the voices list again and store the result on the entry."""
+    session = async_get_clientsession(hass)
+    voice_ok, voice_detail = await async_validate_voice_access(
+        session, entry.data[CONF_API_KEY]
+    )
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_VOICE_ACCESS: {"ok": voice_ok, "detail": voice_detail},
+        },
+    )
+    stored = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if isinstance(stored, dict):
+        stored["voice_ok"] = voice_ok
+        stored["voice_detail"] = voice_detail
+    async_publish_voice_repair(hass, entry, voice_ok, voice_detail)
+    return voice_ok, voice_detail
 
 
 def _usage_tracker(hass: HomeAssistant, entry_id: str) -> UsageTracker | None:
@@ -768,20 +827,29 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         )
 
     async def clear_memory(call: ServiceCall) -> ServiceResponse:
-        """Best-effort clear of conversation agent memory / chat logs."""
-        entry = _validate_config_entry(hass, call.data["config_entry"])
-        cleared = {"conversation_agent": False, "notes": []}
-        try:
-            # HA stores conversation history via conversation component; reload agent.
-            await hass.config_entries.async_reload(entry.entry_id)
-            cleared["conversation_agent"] = True
-            cleared["notes"].append(
-                "Reloaded integration to reset in-memory agent state. "
+        """Leave chat history to Home Assistant without reloading the entry.
+
+        Reloading would run setup again and throw away the cached voice probe.
+        """
+        _validate_config_entry(hass, call.data["config_entry"])
+        return {
+            "status": "ok",
+            "conversation_agent": False,
+            "notes": [
+                "Left the config entry loaded. "
                 "Home Assistant chat log history is managed by the conversation integration."
-            )
-        except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(f"Failed to clear memory: {err}") from err
-        return {"status": "ok", **cleared}
+            ],
+        }
+
+    async def recheck_voice(call: ServiceCall) -> ServiceResponse:
+        """Probe the voices list again for this entry."""
+        entry = _validate_config_entry(hass, call.data["config_entry"])
+        voice_ok, voice_detail = await async_recheck_voice_access(hass, entry)
+        return {
+            "status": "ok",
+            "voice_ok": voice_ok,
+            "voice_detail": voice_detail,
+        }
 
     async def reset_stats(call: ServiceCall) -> ServiceResponse:
         """Reset token usage counters."""
@@ -996,6 +1064,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     hass.services.async_register(
         DOMAIN,
+        SERVICE_RECHECK_VOICE,
+        recheck_voice,
+        schema=vol.Schema({vol.Required("config_entry"): _cfg_entry_selector()}),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
         SERVICE_RESET_STATS,
         reset_stats,
         schema=vol.Schema({vol.Required("config_entry"): _cfg_entry_selector()}),
@@ -1045,11 +1121,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool
         tracker = UsageTracker(hass, entry.entry_id)
         await tracker.async_load()
 
-        # Probe Voice API (TTS/STT) — conversation still works if voice is denied
-        session = async_get_clientsession(hass)
-        voice_ok, voice_detail = await async_validate_voice_access(
-            session, entry.data[CONF_API_KEY]
-        )
+        # Remember the voices-list result. Reauth and an explicit recheck refresh it.
+        cached_voice = _voice_access_cache(entry)
+        if cached_voice is None:
+            session = async_get_clientsession(hass)
+            voice_ok, voice_detail = await async_validate_voice_access(
+                session, entry.data[CONF_API_KEY]
+            )
+            hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_VOICE_ACCESS: {"ok": voice_ok, "detail": voice_detail},
+                },
+            )
+        else:
+            voice_ok = bool(cached_voice["ok"])
+            voice_detail = str(cached_voice.get("detail") or "")
+        async_publish_voice_repair(hass, entry, voice_ok, voice_detail)
         if voice_ok:
             LOGGER.info("xAI Voice API OK: %s", voice_detail)
         else:
