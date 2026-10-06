@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -27,8 +28,12 @@ USAGE_SAVE_DELAY_SECONDS = 15.0
 # Re-fire the budget event while spend stays over the threshold, but not every turn.
 BUDGET_WARNING_COOLDOWN = timedelta(hours=6)
 
-# Standard list rates below the long-context tier, USD per 1M tokens.
+# Prompt size at which xAI bills the long-context rate for every token.
 # https://docs.x.ai/developers/pricing — estimates, not an invoice.
+LONG_CONTEXT_PROMPT_TOKENS = 200_000
+
+# Standard list rates below the long-context tier, USD per 1M tokens.
+# Models in _LONG_CONTEXT_PREFIXES double both rates at that tier.
 _MODEL_TOKEN_PRICES: tuple[tuple[str, float, float], ...] = (
     ("grok-4.7", 2.0, 6.0),
     ("grok-4.6", 2.0, 6.0),
@@ -42,13 +47,32 @@ _MODEL_TOKEN_PRICES: tuple[tuple[str, float, float], ...] = (
     ("grok-2", 2.0, 10.0),
 )
 
-# USD per generated image. Longer prefixes are matched first.
+# Models whose published table has a doubled rate at LONG_CONTEXT_PROMPT_TOKENS.
+_LONG_CONTEXT_PREFIXES: tuple[str, ...] = (
+    "grok-4.7",
+    "grok-4.6",
+    "grok-4.5",
+    "grok-4.3",
+    "grok-4.20",
+    "grok-build-0.1",
+)
+
+# Flat USD per image. grok-imagine-image-2.0 is priced separately by tier.
 _IMAGINE_PRICES: tuple[tuple[str, float], ...] = (
     ("grok-imagine-image-quality", 0.05),
-    ("grok-imagine-image-2.0", 0.04),
     ("grok-imagine-image", 0.02),
 )
 DEFAULT_IMAGINE_USD = 0.02
+
+# grok-imagine-image-2.0: 1k/low $0.04, 1k/medium $0.06, 2k/low $0.06, 2k/medium $0.08.
+# Omitted resolution is 1k. Omitted quality is auto, which bills generation at low.
+_IMAGINE_2_0_PREFIX = "grok-imagine-image-2.0"
+_IMAGINE_2_0_PRICES: dict[tuple[str, str], float] = {
+    ("1k", "low"): 0.04,
+    ("1k", "medium"): 0.06,
+    ("2k", "low"): 0.06,
+    ("2k", "medium"): 0.08,
+}
 
 
 def _matches_model_prefix(model_id: str, prefix: str) -> bool:
@@ -56,21 +80,55 @@ def _matches_model_prefix(model_id: str, prefix: str) -> bool:
     return model_id == prefix or model_id.startswith(f"{prefix}-")
 
 
-def token_prices_for_model(model: str) -> tuple[float, float]:
-    """Return (input, output) USD per 1M tokens for a model id."""
+def token_prices_for_model(
+    model: str, prompt_tokens: int = 0
+) -> tuple[float, float]:
+    """Return (input, output) USD per 1M tokens for a model id.
+
+    A prompt at or above the long-context tier uses that model's doubled rate
+    for every input and output token in the request.
+    """
     mid = (model or "").strip().lower()
-    for prefix, input_price, output_price in sorted(
+    input_price = DEFAULT_INPUT_PRICE_PER_M
+    output_price = DEFAULT_OUTPUT_PRICE_PER_M
+    for prefix, listed_input, listed_output in sorted(
         _MODEL_TOKEN_PRICES, key=lambda row: len(row[0]), reverse=True
     ):
         if _matches_model_prefix(mid, prefix):
-            return input_price, output_price
-    return DEFAULT_INPUT_PRICE_PER_M, DEFAULT_OUTPUT_PRICE_PER_M
+            input_price = listed_input
+            output_price = listed_output
+            break
+    long_context = int(prompt_tokens or 0) >= LONG_CONTEXT_PROMPT_TOKENS and any(
+        _matches_model_prefix(mid, prefix) for prefix in _LONG_CONTEXT_PREFIXES
+    )
+    if long_context:
+        return input_price * 2, output_price * 2
+    return input_price, output_price
 
 
-def imagine_estimate_usd(model: str, count: int = 1) -> float:
-    """Estimated USD for ``count`` Imagine images of ``model``."""
+def imagine_estimate_usd(
+    model: str,
+    count: int = 1,
+    *,
+    resolution: str | None = None,
+    quality: str | None = None,
+) -> float:
+    """Estimated USD for ``count`` Imagine images of ``model``.
+
+    ``grok-imagine-image-2.0`` follows resolution and quality. Other Imagine
+    models stay on their flat per-image rate.
+    """
     mid = (model or "").strip().lower()
     images = max(int(count or 1), 1)
+    if _matches_model_prefix(mid, _IMAGINE_2_0_PREFIX):
+        tier_resolution = (resolution or "1k").strip().lower()
+        tier_quality = (quality or "low").strip().lower()
+        if tier_quality == "auto":
+            tier_quality = "low"
+        price = _IMAGINE_2_0_PRICES.get(
+            (tier_resolution, tier_quality), _IMAGINE_2_0_PRICES[("1k", "low")]
+        )
+        return round(price * images, 6)
     for prefix, price in sorted(
         _IMAGINE_PRICES, key=lambda row: len(row[0]), reverse=True
     ):
@@ -142,6 +200,9 @@ class UsageTracker:
         self._listeners: list[callback] = []
         self._unsub_save: Callable[[], None] | None = None
         self._dirty = False
+        self._revision = 0
+        self._saved_revision = 0
+        self._save_lock = asyncio.Lock()
 
     async def async_load(self) -> None:
         """Load from disk."""
@@ -153,9 +214,14 @@ class UsageTracker:
         """Persist to disk."""
         await self._store.async_save(self.snapshot.to_dict())
 
+    def _mark_dirty(self) -> None:
+        """Remember that memory is ahead of the last successful write."""
+        self._revision += 1
+        self._dirty = True
+
     def _schedule_save(self) -> None:
         """Persist soon, without blocking the reply that recorded usage."""
-        self._dirty = True
+        self._mark_dirty()
         if self._unsub_save is not None:
             return
         self._unsub_save = async_call_later(
@@ -165,20 +231,30 @@ class UsageTracker:
     async def _async_debounced_save(self, _now: datetime) -> None:
         """Write the snapshot after the debounce delay."""
         self._unsub_save = None
-        if not self._dirty:
-            return
-        self._dirty = False
-        await self.async_save()
+        await self._save_dirty()
+
+    async def _save_dirty(self) -> None:
+        """Write until the snapshot that finished last is on disk.
+
+        Dirty stays set until that write returns. A flush during the write
+        waits for it, then writes again if a newer record arrived.
+        """
+        async with self._save_lock:
+            while self._saved_revision != self._revision:
+                revision = self._revision
+                await self.async_save()
+                if self._revision == revision:
+                    self._saved_revision = revision
+                    self._dirty = False
+                else:
+                    self._saved_revision = revision
 
     async def async_flush(self) -> None:
-        """Cancel a pending debounce and write the snapshot now."""
+        """Cancel a pending debounce and wait for the snapshot to hit disk."""
         if self._unsub_save is not None:
             self._unsub_save()
             self._unsub_save = None
-        if not self._dirty:
-            return
-        self._dirty = False
-        await self.async_save()
+        await self._save_dirty()
 
     def _notify(self) -> None:
         """Publish the in-memory snapshot to listeners and the event bus."""
@@ -251,14 +327,14 @@ class UsageTracker:
         ``extra_cost_usd`` is the Imagine estimate (image calls have no tokens).
         The store write is debounced so this returns before disk I/O.
         """
+        prompt_tokens = max(int(prompt_tokens or 0), 0)
+        completion_tokens = max(int(completion_tokens or 0), 0)
         if input_price_per_m is None or output_price_per_m is None:
-            table_input, table_output = token_prices_for_model(model)
+            table_input, table_output = token_prices_for_model(model, prompt_tokens)
             if input_price_per_m is None:
                 input_price_per_m = table_input
             if output_price_per_m is None:
                 output_price_per_m = table_output
-        prompt_tokens = max(int(prompt_tokens or 0), 0)
-        completion_tokens = max(int(completion_tokens or 0), 0)
         total = prompt_tokens + completion_tokens
         cost = (prompt_tokens / 1_000_000) * input_price_per_m + (
             completion_tokens / 1_000_000
@@ -324,6 +400,10 @@ class UsageTracker:
         if self._unsub_save is not None:
             self._unsub_save()
             self._unsub_save = None
-        self._dirty = False
-        await self.async_save()
+        async with self._save_lock:
+            self._revision += 1
+            revision = self._revision
+            await self.async_save()
+            self._saved_revision = revision
+            self._dirty = False
         self._notify()

@@ -445,7 +445,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             completion_tokens=0,
             service="generate_image",
             extra_cost_usd=imagine_estimate_usd(
-                str(model), int(call.data.get("n") or 1)
+                str(model),
+                int(call.data.get("n") or 1),
+                resolution=call.data.get("resolution"),
+                quality=call.data.get("quality"),
             ),
         )
         return result

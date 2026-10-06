@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import pytest
 
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.core import HomeAssistant
@@ -36,9 +39,25 @@ def test_model_price_table_and_imagine_estimate() -> None:
     )
     assert imagine_estimate_usd(RECOMMENDED_IMAGE_GENERATION_MODEL, 1) == 0.02
     assert imagine_estimate_usd("grok-imagine-image-2.0", 2) == 0.08
+    assert imagine_estimate_usd(
+        "grok-imagine-image-2.0", 1, resolution="1k", quality="low"
+    ) == 0.04
+    assert imagine_estimate_usd(
+        "grok-imagine-image-2.0", 1, resolution="1k", quality="medium"
+    ) == 0.06
+    assert imagine_estimate_usd(
+        "grok-imagine-image-2.0", 1, resolution="2k", quality="low"
+    ) == 0.06
+    assert imagine_estimate_usd(
+        "grok-imagine-image-2.0", 1, resolution="2k", quality="medium"
+    ) == 0.08
     assert imagine_estimate_usd("grok-imagine-image-quality") == 0.05
     # The shorter imagine-image prefix must not steal the 2.0 rate.
     assert imagine_estimate_usd("grok-imagine-image") == 0.02
+    assert token_prices_for_model("grok-4.3", 199_999) == (1.25, 2.50)
+    assert token_prices_for_model("grok-4.3", 200_000) == (2.50, 5.00)
+    assert token_prices_for_model("grok-4.6", 200_000) == (4.0, 12.0)
+    assert token_prices_for_model("grok-3", 500_000) == (3.0, 15.0)
 
 
 async def test_record_debits_table_price_without_waiting_on_disk(
@@ -56,19 +75,60 @@ async def test_record_debits_table_price_without_waiting_on_disk(
 
     await tracker.async_record(
         model="grok-4.3",
-        prompt_tokens=1_000_000,
-        completion_tokens=1_000_000,
+        prompt_tokens=100_000,
+        completion_tokens=100_000,
         service="conversation",
     )
 
     assert saves == []
-    assert tracker.snapshot.estimated_cost_usd == 1.25 + 2.50
-    assert tracker.snapshot.by_model["grok-4.3"]["estimated_cost_usd"] == 3.75
+    assert tracker.snapshot.estimated_cost_usd == 0.125 + 0.25
+    assert tracker.snapshot.by_model["grok-4.3"]["estimated_cost_usd"] == 0.375
     assert tracker._dirty is True  # noqa: SLF001
 
     await tracker.async_flush()
     assert saves == [1]
     assert tracker._dirty is False  # noqa: SLF001
+
+
+async def test_flush_awaits_inflight_save_and_keeps_dirty_on_failure(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Flush waits for the write in progress, and a failure stays dirty."""
+    tracker = hass.data[DOMAIN][mock_config_entry.entry_id]["usage"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _save() -> None:
+        started.set()
+        await release.wait()
+
+    tracker.async_save = _save  # type: ignore[method-assign]
+    await tracker.async_record(model="grok-4.3", prompt_tokens=10, completion_tokens=1)
+    unsub = tracker._unsub_save  # noqa: SLF001
+    assert unsub is not None
+    tracker._unsub_save = None  # noqa: SLF001
+    unsub()
+    save_task = asyncio.create_task(tracker._async_debounced_save(None))  # noqa: SLF001
+    await started.wait()
+    assert tracker._dirty is True  # noqa: SLF001
+
+    flush_task = asyncio.create_task(tracker.async_flush())
+    await asyncio.sleep(0)
+    assert not flush_task.done()
+    release.set()
+    await flush_task
+    await save_task
+    assert tracker._dirty is False  # noqa: SLF001
+
+    async def _fail() -> None:
+        raise OSError("disk")
+
+    tracker.async_save = _fail  # type: ignore[method-assign]
+    await tracker.async_record(model="grok-4.3", prompt_tokens=10, completion_tokens=1)
+    with pytest.raises(OSError, match="disk"):
+        await tracker.async_flush()
+    assert tracker._dirty is True  # noqa: SLF001
 
 
 async def test_budget_warning_fires_on_cross_then_cooldown(
@@ -98,7 +158,7 @@ async def test_budget_warning_fires_on_cross_then_cooldown(
     )
     await hass.async_block_till_done()
     assert len(events) == 1
-    assert events[0] == 1.25
+    assert events[0] == 2.50
 
     tracker.snapshot.budget_warned_at = (
         datetime.now(timezone.utc) - timedelta(hours=7)
@@ -181,9 +241,23 @@ async def test_generate_image_records_imagine_estimate(
         blocking=True,
         return_response=True,
     )
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_GENERATE_IMAGE,
+        {
+            "config_entry": mock_config_entry.entry_id,
+            CONF_PROMPT: "one dog, sharper",
+            "n": 1,
+            "model": "grok-imagine-image-2.0",
+            "resolution": "2k",
+            "quality": "medium",
+        },
+        blocking=True,
+        return_response=True,
+    )
 
     assert tracker.snapshot.prompt_tokens == 0
     assert tracker.snapshot.completion_tokens == 0
-    assert tracker.snapshot.estimated_cost_usd == 0.08
-    assert tracker.snapshot.by_service["generate_image"]["estimated_cost_usd"] == 0.08
+    assert tracker.snapshot.estimated_cost_usd == 0.08 + 0.08
+    assert tracker.snapshot.by_service["generate_image"]["estimated_cost_usd"] == 0.16
     assert tracker.snapshot.last_model == "grok-imagine-image-2.0"
