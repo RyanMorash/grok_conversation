@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from homeassistant.components import conversation
@@ -65,6 +66,51 @@ from .entity import (
     convert_content_to_param,
     _strip_json_from_response,
 )
+
+# Room names ("family room", "guest bedroom") and shopping lists are not
+# presence requests. Require an explicit people or presence question.
+# Short words use boundaries so "personal" and "train" do not count.
+_PEOPLE_QUERY = re.compile(
+    r"\b("
+    r"who(?:'s|’s| is| are) (?:home|away|here)|"
+    r"(?:anyone|anybody) (?:home|here|away)|"
+    r"is anyone|"
+    r"presence|"
+    r"(?:people|persons?) (?:home|here|away|present)|"
+    r"(?:the |my |our )?(?:family|families) (?:home|here|away)|"
+    r"household (?:home|members|presence)|"
+    r"(?:any )?guests? (?:home|here|present|staying)|"
+    r"any guests?"
+    r")\b",
+    re.IGNORECASE,
+)
+# Indoor appliances and business forecasts are not weather requests.
+_WEATHER_QUERY = re.compile(
+    r"\b("
+    r"weather|"
+    r"raining|rain|snowing|snow|humid|"
+    r"temperature outside|outside temp(?:erature)?|"
+    r"how (?:hot|cold|warm|cool) (?:is it|outside)|"
+    r"(?:weather )?forecast (?:for )?(?:today|tonight|tomorrow|"
+    r"the (?:day|week|weekend)|this (?:week|weekend)|outside)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def utterance_requests_people(text: str) -> bool:
+    """Return True when the utterance asks about people or presence."""
+    return _PEOPLE_QUERY.search(text or "") is not None
+
+
+def utterance_requests_weather(text: str) -> bool:
+    """Return True when the utterance asks about weather."""
+    return _WEATHER_QUERY.search(text or "") is not None
+
+
+def utterance_requests_household(text: str) -> bool:
+    """Return True when the utterance asks about people, presence, or weather."""
+    return utterance_requests_people(text) or utterance_requests_weather(text)
 
 
 async def async_setup_entry(
@@ -185,11 +231,10 @@ class OpenAIConversationEntity(
     def _build_factual_context(
         self, user_input: conversation.ConversationInput
     ) -> str:
-        """Location, local time, presence, weather — needed by live search.
+        """Location and timezone for local queries.
 
-        Always attach this to the search pass even when HA tools are present
-        (#27). Persona/voice bits are built separately and also attached on
-        the search pass (#32).
+        Person presence and weather are added only when home context is on
+        and the utterance asks about people, presence, or weather.
         """
         options = self.entry.options
         parts: list[str] = []
@@ -210,29 +255,31 @@ class OpenAIConversationEntity(
             parts.append(
                 f"Current local time: {now.strftime('%A %Y-%m-%d %H:%M')}."
             )
-            people = []
-            for state in self.hass.states.async_all("person"):
-                people.append(
-                    f"{state.attributes.get('friendly_name', state.entity_id)}={state.state}"
+            if utterance_requests_people(user_input.text):
+                people = []
+                for state in self.hass.states.async_all("person"):
+                    people.append(
+                        f"{state.attributes.get('friendly_name', state.entity_id)}={state.state}"
+                    )
+                if people:
+                    parts.append("Person presence: " + ", ".join(people[:12]) + ".")
+            if utterance_requests_weather(user_input.text):
+                weather = next(
+                    (
+                        s
+                        for s in self.hass.states.async_all("weather")
+                        if s.state not in ("unavailable", "unknown")
+                    ),
+                    None,
                 )
-            if people:
-                parts.append("Person presence: " + ", ".join(people[:12]) + ".")
-            weather = next(
-                (
-                    s
-                    for s in self.hass.states.async_all("weather")
-                    if s.state not in ("unavailable", "unknown")
-                ),
-                None,
-            )
-            if weather:
-                temp = weather.attributes.get("temperature")
-                unit = weather.attributes.get("temperature_unit", "")
-                parts.append(
-                    f"Weather entity {weather.entity_id}: {weather.state}"
-                    + (f", {temp}{unit}" if temp is not None else "")
-                    + "."
-                )
+                if weather:
+                    temp = weather.attributes.get("temperature")
+                    unit = weather.attributes.get("temperature_unit", "")
+                    parts.append(
+                        f"Weather entity {weather.entity_id}: {weather.state}"
+                        + (f", {temp}{unit}" if temp is not None else "")
+                        + "."
+                    )
 
         return "\n".join(parts)
 
@@ -433,7 +480,7 @@ class OpenAIConversationEntity(
         options = self.entry.options
         mode = options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
 
-        LOGGER.info(
+        LOGGER.debug(
             "Grok handling message mode=%s device_id=%s text=%s",
             mode,
             user_input.device_id,
