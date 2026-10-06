@@ -84,6 +84,7 @@ from .const import (
     RETIRED_VISION_MODELS,
     UNSUPPORTED_MODELS,
     effective_model_choice,
+    pick_default_llm_api,
 )
 from .api_helpers import (
     PROBE_TIMEOUT_SECONDS,
@@ -170,7 +171,7 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Grok Conversation."""
 
     VERSION = 1
-    MINOR_VERSION = 3
+    MINOR_VERSION = 4
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -199,10 +200,14 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                     info.get("voice_detail"),
                 )
                 # Still create — conversation works; TTS/STT may need key permissions
+            options = dict(RECOMMENDED_OPTIONS)
+            api_id = pick_default_llm_api(llm.async_get_apis(self.hass))
+            if api_id:
+                options[CONF_LLM_HASS_API] = [api_id]
             return self.async_create_entry(
                 title="xAI Grok",
                 data=user_input,
-                options=RECOMMENDED_OPTIONS,
+                options=options,
                 subentries=[
                     {
                         "subentry_type": "ai_task_data",
@@ -331,17 +336,9 @@ class OpenAIOptionsFlow(OptionsFlow):
                         # Common HA Assist aliases
                         key = str(api_id).strip().lower()
                         if key in {"assist", "home assistant", "homeassistant"} and available_apis:
-                            pick = next(
-                                (
-                                    a.id
-                                    for a in available_apis
-                                    if "assist" in a.id.lower()
-                                    or "assist" in (a.name or "").lower()
-                                    or a.id == "homeassistant"
-                                ),
-                                available_apis[0].id,
-                            )
-                            resolved.append(pick)
+                            pick = pick_default_llm_api(available_apis)
+                            if pick:
+                                resolved.append(pick)
                             continue
                         resolved.append(api_id)
 
@@ -354,7 +351,8 @@ class OpenAIOptionsFlow(OptionsFlow):
                             api_list.append(a)
 
                     if not api_list:
-                        user_input.pop(CONF_LLM_HASS_API, None)
+                        # Persist No control. Dropping the key looks like "never set".
+                        user_input[CONF_LLM_HASS_API] = ["none"]
                     else:
                         invalid_apis = [
                             api_id
@@ -383,7 +381,8 @@ class OpenAIOptionsFlow(OptionsFlow):
                         else:
                             user_input[CONF_LLM_HASS_API] = api_list
                 else:
-                    user_input.pop(CONF_LLM_HASS_API, None)
+                    if CONF_LLM_HASS_API in user_input:
+                        user_input[CONF_LLM_HASS_API] = ["none"]
 
                 # Validate model picks (allow custom values that look chat-capable)
                 for model_key in (CONF_CHAT_MODEL, CONF_FAST_MODEL, CONF_FALLBACK_MODEL):

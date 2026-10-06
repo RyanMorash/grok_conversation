@@ -56,6 +56,8 @@ from .const import (
     RECOMMENDED_TOP_P,
     RECOMMENDED_VOICE_OPTIMIZED,
     VOICE_OPTIMIZED_SUFFIX,
+    active_llm_api_ids,
+    prompt_for_interaction,
     remap_retired_chat_model,
 )
 from .entity import (
@@ -117,21 +119,19 @@ class OpenAIConversationEntity(
         mode = self.entry.options.get(
             CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
         )
-        llm_hass_api = self.entry.options.get(CONF_LLM_HASS_API)
-        if mode == MODE_CHAT_ONLY or not llm_hass_api:
-            self._attr_supported_features = conversation.ConversationEntityFeature(0)
-            return
-        api_ids = llm_hass_api if isinstance(llm_hass_api, list) else [llm_hass_api]
-        api_ids = [api_id for api_id in api_ids if api_id != "none"]
-        if not api_ids:
+        api_ids = active_llm_api_ids(self.entry.options.get(CONF_LLM_HASS_API))
+        if mode == MODE_CHAT_ONLY or not api_ids:
             self._attr_supported_features = conversation.ConversationEntityFeature(0)
             return
         try:
-            llm.async_get_api(self.hass, api_ids[0])
+            known = {api.id for api in llm.async_get_apis(self.hass)}
+        except Exception:  # noqa: BLE001
+            known = set()
+        if api_ids[0] in known:
             self._attr_supported_features = (
                 conversation.ConversationEntityFeature.CONTROL
             )
-        except Exception:  # noqa: BLE001
+        else:
             self._attr_supported_features = conversation.ConversationEntityFeature(0)
 
     async def async_will_remove_from_hass(self) -> None:
@@ -448,17 +448,22 @@ class OpenAIConversationEntity(
                 return piped
 
         # Chat-only: disable LLM HASS API tools
-        llm_api_option = None if mode == MODE_CHAT_ONLY else options.get(CONF_LLM_HASS_API)
+        llm_api_option = (
+            None
+            if mode == MODE_CHAT_ONLY
+            else active_llm_api_ids(options.get(CONF_LLM_HASS_API)) or None
+        )
 
         extra = self._build_extra_system_prompt(user_input)
         user_extra = user_input.extra_system_prompt or ""
         combined_extra = "\n".join(p for p in (extra, user_extra) if p)
+        effective_prompt = prompt_for_interaction(mode, options.get(CONF_PROMPT))
 
         try:
             await chat_log.async_provide_llm_data(
                 user_input.as_llm_context(DOMAIN),
                 llm_api_option,
-                options.get(CONF_PROMPT),
+                effective_prompt,
                 combined_extra or None,
             )
         except conversation.ConverseError as err:
@@ -521,8 +526,8 @@ class OpenAIConversationEntity(
                 "When the user says 'near me' / local / open now, use the home "
                 "location and local time below — do not ask them for a city.",
             ]
-            if options.get(CONF_PROMPT):
-                search_system.append(str(options.get(CONF_PROMPT)))
+            if effective_prompt:
+                search_system.append(str(effective_prompt))
             # Factual context ALWAYS reaches the search pass (#27), even with HA tools
             factual = self._build_factual_context(user_input)
             if factual:

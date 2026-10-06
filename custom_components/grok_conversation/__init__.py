@@ -1099,6 +1099,12 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         hass.config_entries.async_update_entry(entry, **update_kwargs)
 
+    if entry.version == 1 and entry.minor_version < 4:
+        # "No control" removed CONF_LLM_HASS_API, so a missing key is also an
+        # opt-out. Do not restore Assist. New entries still store the API at
+        # creation, and an explicit ["none"] opt-out is left as stored.
+        hass.config_entries.async_update_entry(entry, minor_version=4)
+
     LOGGER.debug(
         "Migration to version %s.%s successful",
         entry.version,
