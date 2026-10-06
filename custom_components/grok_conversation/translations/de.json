@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "xAI ist gerade ausgelastet. Bitte versuche es gleich noch einmal."
+    },
+    "auth_failed": {
+      "message": "Der xAI-API-Schlüssel wurde abgelehnt. Aktualisiere ihn in den Einstellungen."
+    },
+    "token_length": {
+      "message": "Die Antwort wurde abgeschnitten. Erhöhe das Token-Limit und versuche es erneut."
+    }
   }
 }

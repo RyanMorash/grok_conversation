@@ -17,7 +17,9 @@ from homeassistant.util import dt as dt_util
 from . import GrokConfigEntry
 from .api_helpers import (
     CombinedSearchRejected,
+    XAIAuthError,
     XAIError,
+    XAIRateLimitError,
     async_responses_completion,
     build_search_parameters,
     looks_like_search_query,
@@ -68,6 +70,7 @@ from .entity import (
     convert_content_to_param,
     _strip_json_from_response,
 )
+from .exceptions import TokenLengthExceededError
 
 # Spoken Assist turns stop the chat stream here. The shared client timeout
 # stays at 120 seconds so AI Task is unchanged.
@@ -102,6 +105,20 @@ _WEATHER_QUERY = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+def spoken_error_translation_key(err: BaseException) -> str | None:
+    """Map rate limit, auth failure, and token length to short speech keys."""
+    if isinstance(err, TokenLengthExceededError):
+        return "token_length"
+    cause = err.__cause__
+    if isinstance(err, XAIRateLimitError) or isinstance(cause, XAIRateLimitError):
+        return "rate_limit"
+    if "rate limited" in str(err).lower():
+        return "rate_limit"
+    if isinstance(err, XAIAuthError) or isinstance(cause, XAIAuthError):
+        return "auth_failed"
+    return None
 
 
 def utterance_requests_people(text: str) -> bool:
@@ -224,6 +241,17 @@ class OpenAIConversationEntity(
         """Call the API with function calling support."""
         try:
             return await self._async_handle_message_inner(user_input, chat_log)
+        except HomeAssistantError as err:
+            # Assist speaks HomeAssistantError. The three known failures use
+            # short translated strings; every other HomeAssistantError passes
+            # through unchanged.
+            key = spoken_error_translation_key(err)
+            if key is None:
+                raise
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key=key,
+            ) from err
         except Exception as err:  # noqa: BLE001
             LOGGER.error(
                 "Unexpected error in conversation handler: %s", err, exc_info=True

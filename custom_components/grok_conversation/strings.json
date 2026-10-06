@@ -198,6 +198,15 @@
   "exceptions": {
     "invalid_config_entry": {
       "message": "Invalid config entry provided. Got {config_entry}"
+    },
+    "rate_limit": {
+      "message": "xAI is busy right now. Please try again in a moment."
+    },
+    "auth_failed": {
+      "message": "The xAI API key was rejected. Update it in settings."
+    },
+    "token_length": {
+      "message": "That reply was cut off. Raise the token limit and try again."
     }
   }
 }

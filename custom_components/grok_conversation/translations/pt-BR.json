@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "A xAI está ocupada agora. Tente de novo em instantes."
+    },
+    "auth_failed": {
+      "message": "A chave de API da xAI foi recusada. Atualize-a nas configurações."
+    },
+    "token_length": {
+      "message": "Essa resposta foi cortada. Aumente o limite de tokens e tente de novo."
+    }
   }
 }

@@ -68,5 +68,16 @@
               }
           }
       }
+  },
+  "exceptions": {
+    "rate_limit": {
+      "message": "xAI est occupé pour le moment. Réessayez dans un instant."
+    },
+    "auth_failed": {
+      "message": "La clé API xAI a été refusée. Mettez-la à jour dans les paramètres."
+    },
+    "token_length": {
+      "message": "Cette réponse a été coupée. Augmentez la limite de jetons et réessayez."
+    }
   }
 }
