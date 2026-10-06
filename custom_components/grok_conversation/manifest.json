@@ -3,12 +3,7 @@
   "name": "xAI Grok Conversation",
   "after_dependencies": [
     "assist_pipeline",
-    "energy",
-    "history",
     "intent",
-    "recorder",
-    "rest",
-    "scrape",
     "stt",
     "tts"
   ],
