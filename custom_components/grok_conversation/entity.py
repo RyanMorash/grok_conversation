@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import json
 from pathlib import Path
@@ -23,10 +24,19 @@ except ImportError:  # pragma: no cover - HA < 2026.8 may lack probatio
     probatio = None  # type: ignore[assignment]
 
 from .api_helpers import (
+    ChatResult,
     ChatToolCall,
+    CombinedSearchRejected,
+    XAIAuthError,
+    XAIConnectionError,
     XAIError,
+    XAIInvalidArgumentError,
     XAIRateLimitError,
     async_chat_completion,
+    async_chat_stream,
+    chat_result_from_response,
+    format_citations,
+    is_unsupported_tools_search,
 )
 from .const import (
     CONF_BUDGET_WARN_USD,
@@ -697,6 +707,10 @@ class GrokBaseLLMEntity(Entity):
         agent_id: str | None = None,
         service: str = "conversation",
         fallback_model: str | None = None,
+        search_parameters: Any | None = None,
+        stream_final: bool = False,
+        stream_timeout: float | None = None,
+        append_citations: bool = False,
     ) -> None:
         """Run chat completions + tool loop. Does not depend on ConversationInput."""
         opts = options if options is not None else self._llm_options()
@@ -766,8 +780,14 @@ class GrokBaseLLMEntity(Entity):
                     attachment_parts=attachment_parts,
                     max_iterations=max_iterations,
                     skip_json_strip=structure is not None,
+                    search_parameters=search_parameters,
+                    stream_final=stream_final,
+                    stream_timeout=stream_timeout,
+                    append_citations=append_citations,
                 )
                 return
+            except CombinedSearchRejected:
+                raise
             except XAIRateLimitError as err:
                 last_error = err
                 LOGGER.error("Rate limited by xAI on %s: %s", try_model, err)
@@ -798,6 +818,134 @@ class GrokBaseLLMEntity(Entity):
             ) from last_error
         raise HomeAssistantError(f"Error talking to xAI: {last_error}") from last_error
 
+    async def _async_stream_completion(
+        self,
+        client: Any,
+        *,
+        stream_timeout: float | None,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+        top_p: float | None,
+        temperature: float | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | None,
+        reasoning_effort: str | None,
+        user: str | None,
+        response_format: dict[str, Any] | None,
+        search_parameters: Any | None,
+    ) -> tuple[ChatResult, list[str], bool]:
+        """Buffer ``chat.stream()`` until it ends or the deadline passes."""
+        deltas: list[str] = []
+        response: Any = None
+        timed_out = False
+        stream = async_chat_stream(
+            client,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            tool_choice=tool_choice,
+            reasoning_effort=reasoning_effort,
+            user=user,
+            response_format=response_format,
+            search_parameters=search_parameters,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = (
+                None if stream_timeout is None else loop.time() + stream_timeout
+            )
+            while True:
+                if deadline is None:
+                    try:
+                        response, chunk = await anext(stream)
+                    except StopAsyncIteration:
+                        break
+                else:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    try:
+                        response, chunk = await asyncio.wait_for(
+                            anext(stream), remaining
+                        )
+                    except TimeoutError:
+                        timed_out = True
+                        break
+                    except StopAsyncIteration:
+                        break
+                piece = getattr(chunk, "content", None) or ""
+                if piece:
+                    deltas.append(str(piece))
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    LOGGER.debug("Closing chat stream failed", exc_info=True)
+
+        if response is None:
+            result = ChatResult(content="".join(deltas))
+        else:
+            result = chat_result_from_response(response)
+            if not result.content and deltas:
+                result = ChatResult(
+                    content="".join(deltas),
+                    tool_calls=result.tool_calls,
+                    finish_reason=result.finish_reason,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                    citations=list(result.citations),
+                )
+        return result, deltas, timed_out
+
+    async def _async_add_streamed_text(
+        self,
+        chat_log: conversation.ChatLog,
+        *,
+        agent_id: str,
+        raw_text: str,
+        deltas: list[str],
+        citation_text: str,
+        skip_json_strip: bool,
+    ) -> str:
+        """Replay buffered text deltas. Tool-call turns never reach this."""
+        text = raw_text if skip_json_strip else _strip_json_from_response(raw_text)
+        if deltas and "".join(deltas) == raw_text and text == raw_text:
+            pieces = [piece for piece in deltas if piece]
+        else:
+            pieces = [text] if text else []
+        if citation_text:
+            pieces.append(citation_text)
+        full = "".join(pieces)
+        if not pieces:
+            if skip_json_strip:
+                async for _ in chat_log.async_add_assistant_content(
+                    conversation.AssistantContent(agent_id=agent_id, content=full)
+                ):
+                    pass
+            return full
+
+        async def _deltas():
+            started = False
+            for piece in pieces:
+                if not piece:
+                    continue
+                if not started:
+                    yield {"role": "assistant", "content": piece}
+                    started = True
+                else:
+                    yield {"content": piece}
+
+        async for _ in chat_log.async_add_delta_content_stream(agent_id, _deltas()):
+            pass
+        return full
+
     async def _async_tool_loop(
         self,
         *,
@@ -812,9 +960,14 @@ class GrokBaseLLMEntity(Entity):
         attachment_parts: list[dict[str, Any]] | None,
         max_iterations: int,
         skip_json_strip: bool,
+        search_parameters: Any | None = None,
+        stream_final: bool = False,
+        stream_timeout: float | None = None,
+        append_citations: bool = False,
     ) -> None:
         """Run chat completion tool iterations for one model."""
         working_messages = messages
+        saved_citations: list[Any] = []
         default_max_tokens = (
             RECOMMENDED_AI_TASK_MAX_TOKENS
             if service == "ai_task"
@@ -874,30 +1027,70 @@ class GrokBaseLLMEntity(Entity):
                 use_tools = tools
             use_response_format = response_format
 
+            # Search stays on later rounds. The provider's results are not in
+            # the tool messages, so a follow-up without search_parameters would
+            # answer from the tool payload alone.
+            call_search = search_parameters
+            completion_kwargs = {
+                "model": model,
+                "messages": request_messages,
+                "max_tokens": options.get(CONF_MAX_TOKENS, default_max_tokens),
+                "top_p": options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
+                "temperature": options.get(CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE),
+                "tools": use_tools,
+                "tool_choice": "auto" if use_tools else None,
+                "reasoning_effort": options.get(
+                    CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
+                ),
+                "user": chat_log.conversation_id,
+                "response_format": use_response_format,
+                "search_parameters": call_search,
+            }
             try:
-                result = await async_chat_completion(
-                    client,
-                    model=model,
-                    messages=request_messages,
-                    max_tokens=options.get(CONF_MAX_TOKENS, default_max_tokens),
-                    top_p=options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
-                    temperature=options.get(
-                        CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
-                    ),
-                    tools=use_tools,
-                    tool_choice="auto" if use_tools else None,
-                    reasoning_effort=options.get(
-                        CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-                    ),
-                    user=chat_log.conversation_id,
-                    response_format=use_response_format,
-                )
+                if stream_final:
+                    result, deltas, timed_out = await self._async_stream_completion(
+                        client,
+                        stream_timeout=stream_timeout,
+                        **completion_kwargs,
+                    )
+                else:
+                    result = await async_chat_completion(client, **completion_kwargs)
+                    deltas = []
+                    timed_out = False
+            except XAIRateLimitError:
+                raise
+            except (XAIAuthError, XAIConnectionError):
+                raise
+            except XAIInvalidArgumentError as err:
+                if (
+                    _iteration == 0
+                    and call_search is not None
+                    and use_tools
+                    and is_unsupported_tools_search(err)
+                ):
+                    raise CombinedSearchRejected(str(err)) from err
+                raise
             except XAIError:
                 raise
+
+            if timed_out:
+                LOGGER.debug(
+                    "Stopped chat stream after %.0f seconds",
+                    stream_timeout or 0,
+                )
+                result = ChatResult(
+                    content=result.content,
+                    finish_reason="stop",
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                )
+                deltas = [result.content] if result.content else []
 
             p_tok, c_tok = result.prompt_tokens, result.completion_tokens
 
             if result.tool_calls:
+                if result.citations:
+                    saved_citations = list(result.citations)
                 ha_tool_calls, parse_errors = self._tool_calls_to_ha(
                     result.tool_calls
                 )
@@ -964,16 +1157,34 @@ class GrokBaseLLMEntity(Entity):
                 continue
 
             raw_text = result.content or ""
-            full_response = (
-                raw_text if skip_json_strip else _strip_json_from_response(raw_text)
-            )
-            if full_response or skip_json_strip:
-                async for _ in chat_log.async_add_assistant_content(
-                    conversation.AssistantContent(
-                        agent_id=agent_id, content=full_response
+            if stream_final:
+                citation_text = ""
+                if append_citations:
+                    citation_text = format_citations(
+                        saved_citations or result.citations
                     )
-                ):
-                    pass
+                full_response = await self._async_add_streamed_text(
+                    chat_log,
+                    agent_id=agent_id,
+                    raw_text=raw_text,
+                    deltas=deltas,
+                    citation_text=citation_text,
+                    skip_json_strip=skip_json_strip,
+                )
+            else:
+                full_response = (
+                    raw_text
+                    if skip_json_strip
+                    else _strip_json_from_response(raw_text)
+                )
+                if full_response or skip_json_strip:
+                    async for _ in chat_log.async_add_assistant_content(
+                        conversation.AssistantContent(
+                            agent_id=agent_id, content=full_response
+                        )
+                    ):
+                        pass
+            if full_response or skip_json_strip:
                 if working_messages is not None:
                     working_messages.append(
                         {"role": "assistant", "content": full_response}
