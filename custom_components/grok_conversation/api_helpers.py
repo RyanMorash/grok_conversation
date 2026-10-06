@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 from typing import Any
 
 import grpc
@@ -699,47 +700,116 @@ async def async_generate_images(client: Any, **kwargs: Any) -> list[Any]:
         raise map_xai_error(err) from err
 
 
-# Also expand search heuristics for "near me" / local business
+# Allow-list phrases. Matched on word boundaries so "on x" does not hit
+# "turn on xbox", and "current" does not hit "currently".
+_SEARCH_PHRASES: tuple[str, ...] = (
+    "latest",
+    "news",
+    "headline",
+    "headlines",
+    "today",
+    "tonight",
+    "tomorrow",
+    "right now",
+    "current",
+    "final score",
+    "box score",
+    "score",
+    "scores",
+    "stock",
+    "stocks",
+    "price of",
+    "weather",
+    "forecast",
+    "who won",
+    "who is winning",
+    "standings",
+    "trending",
+    "on x",
+    "on twitter",
+    "search the web",
+    "look up",
+    "google",
+    "what happened",
+    "who is playing",
+    "near me",
+    "nearest",
+    "closest",
+    "open now",
+    "around here",
+    "in my area",
+    "nearby",
+)
+
+_SEARCH_QUERY = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(phrase)
+        for phrase in sorted(_SEARCH_PHRASES, key=len, reverse=True)
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
+
+# Verbs that start a device command even when the sentence also has a
+# lookup word such as "today". "open" and "close" are not in this list:
+# "open restaurants near me" is a lookup.
+_DEVICE_PREFIXES: tuple[str, ...] = (
+    "turn ",
+    "set ",
+    "play ",
+    "lock ",
+    "unlock ",
+    "pause ",
+    "stop ",
+    "switch ",
+    "dim ",
+    "brighten ",
+    "activate ",
+    "deactivate ",
+    "toggle ",
+)
+
+_REQUEST_PREFIX = re.compile(
+    r"^(?:(?:please|can you|could you|would you|will you|hey|ok|okay)\b[, ]*)+",
+    re.IGNORECASE,
+)
+
+_DEVICE_LIGHT = re.compile(
+    r"\b(?:lights? on|lights? off)\b",
+    re.IGNORECASE,
+)
+
+# Home targets for the ambiguous verbs "open" and "close".
+_OPEN_CLOSE_TARGET = re.compile(
+    r"\b(?:doors?|garages?|blinds?|shades?|covers?|curtains?|gates?|windows?|"
+    r"locks?|lights?|lamps?|fans?|valves?|switches?|tvs?|televisions?|"
+    r"speakers?|thermostats?|outlets?|plugs?)\b",
+    re.IGNORECASE,
+)
+
+
+def _command_text(text: str) -> str:
+    """Drop a leading politeness phrase so the verb can be recognized."""
+    stripped = _REQUEST_PREFIX.sub("", (text or "").strip())
+    return stripped.strip().lower()
+
+
 def looks_like_search_query(text: str) -> bool:
     """Allow-list heuristic: user clearly wants fresh/web/X info."""
-    t = (text or "").lower()
-    keywords = (
-        "latest",
-        "news",
-        "headline",
-        "today",
-        "tonight",
-        "tomorrow",
-        "right now",
-        "current",
-        "score",
-        "final score",
-        "stock",
-        "price of",
-        "weather",
-        "forecast",
-        "who won",
-        "who is winning",
-        "final score",
-        "box score",
-        "standings",
-        "trending",
-        "on x",
-        "on twitter",
-        "search the web",
-        "look up",
-        "google",
-        "what happened",
-        "who is playing",
-        "near me",
-        "nearest",
-        "closest",
-        "open now",
-        "around here",
-        "in my area",
-        "nearby",
-    )
-    return any(k in t for k in keywords)
+    return _SEARCH_QUERY.search(text or "") is not None
+
+
+def looks_like_device_command(text: str) -> bool:
+    """Return True for ordinary device commands, not web lookups."""
+    t = _command_text(text)
+    if not t:
+        return False
+    if any(t.startswith(prefix) for prefix in _DEVICE_PREFIXES):
+        return True
+    if t.startswith(("open ", "close ")):
+        return _OPEN_CLOSE_TARGET.search(t) is not None
+    return _DEVICE_LIGHT.search(t) is not None
 
 
 def looks_like_non_search_query(text: str) -> bool:
@@ -776,29 +846,7 @@ def looks_like_non_search_query(text: str) -> bool:
     if any(t.startswith(p) for p in greeting_prefixes):
         return True
 
-    device_prefixes = (
-        "turn ",
-        "set ",
-        "play ",
-        "lock ",
-        "unlock ",
-        "pause ",
-        "stop ",
-        "open ",
-        "close ",
-        "switch ",
-        "dim ",
-        "brighten ",
-        "activate ",
-        "deactivate ",
-        "toggle ",
-    )
-    if any(t.startswith(p) for p in device_prefixes):
-        return True
-    if any(
-        p in t
-        for p in ("lights on", "lights off", "light on", "light off")
-    ):
+    if looks_like_device_command(t):
         return True
 
     non_search_phrases = (
@@ -823,16 +871,18 @@ def looks_like_non_search_query(text: str) -> bool:
 def should_use_live_search(
     text: str, *, interaction_mode: str, live_search: str
 ) -> bool:
-    """Decide whether to run the Responses live-search pass.
+    """Decide whether to attach live search to this utterance.
 
-    - chat_only: always search when live search is enabled (current behavior)
-    - pipeline: allow-list fast True; deny-list False; default True (#30)
-    - tools: keep the stricter allow-list only
+    Device commands never search. ``chat_only`` and ``tools`` search only
+    when the allow-list matches. Pipeline mode still searches by default
+    except for the deny-list.
     """
     if not live_search or live_search == LIVE_SEARCH_OFF:
         return False
+    if looks_like_device_command(text):
+        return False
     if interaction_mode == "chat_only":
-        return True
+        return looks_like_search_query(text)
     if looks_like_search_query(text):
         return True
     if interaction_mode == "pipeline":
