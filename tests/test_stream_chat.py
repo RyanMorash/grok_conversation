@@ -18,7 +18,10 @@ from xai_sdk.proto import chat_pb2
 
 from custom_components.grok_conversation.api_helpers import (
     CLIENT_TIMEOUT_SECONDS,
+    XAIAuthError,
+    XAIConnectionError,
     XAIError,
+    XAIInvalidArgumentError,
     XAIRateLimitError,
 )
 from custom_components.grok_conversation.const import (
@@ -103,6 +106,14 @@ def _raise_gen(exc: BaseException):
         yield None  # pragma: no cover - keeps this an async generator
 
     return _stream
+
+
+def _install_raising_stream(client: MagicMock, exc: BaseException) -> None:
+    async def _stream():
+        raise exc
+        yield None  # pragma: no cover - keeps this an async generator
+
+    client.chat.create.return_value.stream = _stream
 
 
 def _install_streams(client: MagicMock, factories: list) -> None:
@@ -395,7 +406,13 @@ async def test_combined_rejection_uses_two_pass_sample(
     tool = _RecordingTool()
     _install_streams(
         mock_xai_client,
-        [_raise_gen(XAIError("tools and search rejected"))],
+        [
+            _raise_gen(
+                XAIInvalidArgumentError(
+                    "tools and search_parameters are not supported together"
+                )
+            )
+        ],
     )
     mock_xai_client.chat.create.return_value.sample = AsyncMock(
         side_effect=[
@@ -423,6 +440,72 @@ async def test_combined_rejection_uses_two_pass_sample(
     assert "search_parameters" not in tools.kwargs
     assert tools.kwargs["tools"]
     assert mock_xai_client.chat.create.return_value.sample.await_count == 2
+
+
+async def test_post_tool_request_keeps_search_parameters(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A follow-up after a Home Assistant tool still sends live search."""
+    await _use_options(hass, mock_config_entry, **{CONF_LIVE_SEARCH: LIVE_SEARCH_WEB})
+    tool = _RecordingTool()
+    _install_streams(
+        mock_xai_client,
+        [
+            _gen(
+                [
+                    _pair(
+                        "checking",
+                        tool_calls=[_tool_call("test_light", '{"action":"turn_on"}')],
+                    )
+                ]
+            ),
+            _gen([_pair("The score is 2-1.")]),
+        ],
+    )
+    _agent, _log, result, _deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "latest score",
+        tool=tool,
+    )
+
+    assert tool.calls == [{"action": "turn_on"}]
+    assert _speech(result) == "The score is 2-1."
+    assert mock_xai_client.chat.create.call_count == 2
+    first, follow_up = mock_xai_client.chat.create.call_args_list
+    assert first.kwargs["search_parameters"] is not None
+    assert follow_up.kwargs["search_parameters"] is not None
+    assert follow_up.kwargs["tools"]
+    roles = [_message_role(message) for message in follow_up.kwargs["messages"]]
+    assert "tool" in roles
+    assert mock_xai_client.chat.create.return_value.sample.await_count == 0
+
+
+async def test_auth_and_connection_errors_do_not_two_pass(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """Revoked keys and outages stay on normal error handling."""
+    await _use_options(hass, mock_config_entry, **{CONF_LIVE_SEARCH: LIVE_SEARCH_WEB})
+    tool = _RecordingTool()
+    for exc, match in (
+        (XAIAuthError("revoked"), "revoked"),
+        (XAIConnectionError("unreachable"), "unreachable"),
+        (XAIError("primary down"), "primary down"),
+    ):
+        mock_xai_client.chat.create.reset_mock()
+        mock_xai_client.chat.create.return_value.sample = AsyncMock()
+        _install_raising_stream(mock_xai_client, exc)
+        with pytest.raises(HomeAssistantError, match=match):
+            await _turn(hass, mock_config_entry, "latest score", tool=tool)
+        assert mock_xai_client.chat.create.return_value.sample.await_count == 0
+        assert mock_xai_client.chat.create.call_count >= 1
+        for call in mock_xai_client.chat.create.call_args_list:
+            assert call.kwargs["search_parameters"] is not None
+            assert call.kwargs["tools"]
 
 
 async def test_combined_rate_limit_does_not_two_pass(

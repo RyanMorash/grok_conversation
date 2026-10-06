@@ -10,7 +10,9 @@ from custom_components.grok_conversation.api_helpers import (
     XAIAuthError,
     XAIConnectionError,
     XAIError,
+    XAIInvalidArgumentError,
     XAIRateLimitError,
+    is_unsupported_tools_search,
     _normalize_finish_reason,
     build_search_parameters,
     convert_messages,
@@ -166,6 +168,12 @@ def test_map_grpc_status_codes() -> None:
     assert isinstance(
         map_xai_error(_Rpc(grpc.StatusCode.RESOURCE_EXHAUSTED)), XAIRateLimitError
     )
+    invalid = map_xai_error(_Rpc(grpc.StatusCode.INVALID_ARGUMENT))
+    assert isinstance(invalid, XAIInvalidArgumentError)
+    assert is_unsupported_tools_search(invalid)
+    assert not is_unsupported_tools_search(XAIAuthError("revoked"))
+    assert not is_unsupported_tools_search(XAIConnectionError("down"))
+    assert not is_unsupported_tools_search(XAIError("primary down"))
 
 
 def test_normalize_finish_reason_max_context() -> None:

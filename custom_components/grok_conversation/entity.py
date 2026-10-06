@@ -27,12 +27,16 @@ from .api_helpers import (
     ChatResult,
     ChatToolCall,
     CombinedSearchRejected,
+    XAIAuthError,
+    XAIConnectionError,
     XAIError,
+    XAIInvalidArgumentError,
     XAIRateLimitError,
     async_chat_completion,
     async_chat_stream,
     chat_result_from_response,
     format_citations,
+    is_unsupported_tools_search,
 )
 from .const import (
     CONF_BUDGET_WARN_USD,
@@ -1023,7 +1027,10 @@ class GrokBaseLLMEntity(Entity):
                 use_tools = tools
             use_response_format = response_format
 
-            call_search = search_parameters if _iteration == 0 else None
+            # Search stays on later rounds. The provider's results are not in
+            # the tool messages, so a follow-up without search_parameters would
+            # answer from the tool payload alone.
+            call_search = search_parameters
             completion_kwargs = {
                 "model": model,
                 "messages": request_messages,
@@ -1052,9 +1059,18 @@ class GrokBaseLLMEntity(Entity):
                     timed_out = False
             except XAIRateLimitError:
                 raise
-            except XAIError as err:
-                if call_search is not None and use_tools:
+            except (XAIAuthError, XAIConnectionError):
+                raise
+            except XAIInvalidArgumentError as err:
+                if (
+                    _iteration == 0
+                    and call_search is not None
+                    and use_tools
+                    and is_unsupported_tools_search(err)
+                ):
                     raise CombinedSearchRejected(str(err)) from err
+                raise
+            except XAIError:
                 raise
 
             if timed_out:

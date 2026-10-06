@@ -76,6 +76,10 @@ class XAIRateLimitError(XAIError):
     """Rate limited or quota exhausted."""
 
 
+class XAIInvalidArgumentError(XAIError):
+    """The request was rejected as invalid or unsupported."""
+
+
 class CombinedSearchRejected(Exception):
     """Tools and live search were rejected together on one chat.create."""
 
@@ -145,7 +149,17 @@ def map_xai_error(err: BaseException) -> XAIError:
             return XAIConnectionError(details)
         if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
             return XAIRateLimitError(details)
+        if code in (
+            grpc.StatusCode.INVALID_ARGUMENT,
+            grpc.StatusCode.UNIMPLEMENTED,
+        ):
+            return XAIInvalidArgumentError(details)
     return XAIError(details)
+
+
+def is_unsupported_tools_search(err: BaseException) -> bool:
+    """Return True when xAI rejected the tools-plus-search combination."""
+    return isinstance(err, XAIInvalidArgumentError)
 
 
 def is_chat_model_id(model_id: str) -> bool:
