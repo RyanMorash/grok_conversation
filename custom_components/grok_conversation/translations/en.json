@@ -11,6 +11,13 @@
           "api_key": "API Key"
         },
         "description": "Enter your xAI API key from the xAI console. The same key powers Conversation, TTS, and STT (Voice API access is checked automatically)."
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate xAI",
+        "description": "The xAI API key was rejected. Enter a new key.",
+        "data": {
+          "api_key": "API Key"
+        }
       }
     }
   },

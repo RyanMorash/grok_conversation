@@ -20,6 +20,7 @@ from homeassistant.core import (
     SupportsResponse,
 )
 from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     HomeAssistantError,
     ServiceValidationError,
@@ -953,8 +954,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool
     except Exception as err:  # noqa: BLE001
         mapped = map_xai_error(err)
         if isinstance(mapped, XAIAuthError):
-            LOGGER.error("Invalid API key: %s", mapped)
-            return False
+            raise ConfigEntryAuthFailed("Invalid API key") from err
         raise ConfigEntryNotReady(mapped) from err
     finally:
         await close_xai_client(probe)
