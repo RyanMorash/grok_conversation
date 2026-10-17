@@ -214,6 +214,9 @@
     },
     "token_length": {
       "message": "That reply was cut off. Raise the token limit and try again."
+    },
+    "cannot_connect": {
+      "message": "Could not reach xAI. Please try again."
     }
   },
   "issues": {

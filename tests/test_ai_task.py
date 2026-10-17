@@ -367,10 +367,12 @@ async def test_generate_data_api_error(
         side_effect=XAIError("boom")
     )
 
-    with pytest.raises(HomeAssistantError, match="Error talking to xAI"):
+    with pytest.raises(HomeAssistantError) as caught:
         await ai_task.async_generate_data(
             hass,
             task_name="Fail",
             entity_id=ai_task_entity_id,
             instructions="Anything",
         )
+    assert caught.value.translation_key == "cannot_connect"
+    assert "boom" not in str(caught.value)
