@@ -52,6 +52,98 @@
       "abort": {
         "entry_not_loaded": "Cannot configure while the integration is not loaded"
       }
+    },
+    "conversation": {
+      "entry_type": "Conversation",
+      "initiate_flow": {
+        "user": "Add conversation agent",
+        "reconfigure": "Reconfigure conversation agent"
+      },
+      "step": {
+        "init": {
+          "title": "Conversation agent",
+          "data": {
+            "name": "Name",
+            "chat_model": "Chat model",
+            "prompt": "Instructions",
+            "interaction_mode": "Interaction mode"
+          },
+          "data_description": {
+            "chat_model": "Model used for this Assist agent.",
+            "prompt": "Instructions sent with each conversation.",
+            "interaction_mode": "Tools, pipeline, or chat only."
+          }
+        }
+      },
+      "error": {
+        "model_not_supported": "This model is not supported, please select a different model",
+        "model_retired": "This model has been retired by xAI. Choose a current model such as grok-4.3."
+      },
+      "abort": {
+        "entry_not_loaded": "Cannot configure while the integration is not loaded"
+      }
+    },
+    "tts": {
+      "entry_type": "Text-to-speech",
+      "initiate_flow": {
+        "user": "Add text-to-speech engine",
+        "reconfigure": "Reconfigure text-to-speech engine"
+      },
+      "step": {
+        "init": {
+          "title": "Text-to-speech",
+          "data": {
+            "name": "Name",
+            "tts_voice": "Voice",
+            "tts_language": "Language",
+            "tts_speed": "Speed"
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "Cannot configure while the integration is not loaded"
+      }
+    },
+    "stt": {
+      "entry_type": "Speech-to-text",
+      "initiate_flow": {
+        "user": "Add speech-to-text engine",
+        "reconfigure": "Reconfigure speech-to-text engine"
+      },
+      "step": {
+        "init": {
+          "title": "Speech-to-text",
+          "data": {
+            "name": "Name",
+            "stt_language": "Language"
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "Cannot configure while the integration is not loaded"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "total_tokens": {
+        "name": "Total tokens"
+      },
+      "prompt_tokens": {
+        "name": "Prompt tokens"
+      },
+      "completion_tokens": {
+        "name": "Completion tokens"
+      },
+      "request_count": {
+        "name": "API requests"
+      },
+      "estimated_cost_usd": {
+        "name": "Estimated cost"
+      },
+      "last_model": {
+        "name": "Last model"
+      }
     }
   },
   "options": {

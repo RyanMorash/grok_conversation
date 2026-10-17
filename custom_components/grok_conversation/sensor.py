@@ -15,7 +15,7 @@ from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import ACCOUNT_DEVICE_MODEL, DOMAIN
 from .usage import UsageTracker
 
 
@@ -33,23 +33,20 @@ async def async_setup_entry(
         identifiers={(DOMAIN, entry.entry_id)},
         name=entry.title or "Grok",
         manufacturer="xAI",
-        model="Grok Conversation",
+        model=ACCOUNT_DEVICE_MODEL,
         entry_type=DeviceEntryType.SERVICE,
     )
     async_add_entities(
         [
-            GrokUsageSensor(entry, tracker, device, "total_tokens", "Total tokens", "tokens"),
-            GrokUsageSensor(entry, tracker, device, "prompt_tokens", "Prompt tokens", "tokens"),
-            GrokUsageSensor(
-                entry, tracker, device, "completion_tokens", "Completion tokens", "tokens"
-            ),
-            GrokUsageSensor(entry, tracker, device, "request_count", "API requests", "requests"),
+            GrokUsageSensor(entry, tracker, device, "total_tokens", "tokens"),
+            GrokUsageSensor(entry, tracker, device, "prompt_tokens", "tokens"),
+            GrokUsageSensor(entry, tracker, device, "completion_tokens", "tokens"),
+            GrokUsageSensor(entry, tracker, device, "request_count", "requests"),
             GrokUsageSensor(
                 entry,
                 tracker,
                 device,
                 "estimated_cost_usd",
-                "Estimated cost",
                 "USD",
                 precision=4,
             ),
@@ -72,14 +69,13 @@ class GrokUsageSensor(SensorEntity):
         tracker: UsageTracker,
         device: DeviceInfo,
         key: str,
-        name: str,
         unit: str,
         precision: int | None = None,
     ) -> None:
         self._entry = entry
         self._tracker = tracker
         self._key = key
-        self._attr_name = name
+        self._attr_translation_key = key
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_native_unit_of_measurement = unit
         self._attr_device_info = device
@@ -112,7 +108,7 @@ class GrokLastModelSensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Last model"
+    _attr_translation_key = "last_model"
 
     def __init__(
         self, entry: ConfigEntry, tracker: UsageTracker, device: DeviceInfo
