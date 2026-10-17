@@ -6,10 +6,12 @@ from asyncio import CancelledError
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.components import conversation
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_API_KEY, CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -24,11 +26,13 @@ from custom_components.grok_conversation.config_flow import (
 )
 from custom_components.grok_conversation.const import (
     CONF_CHAT_MODEL,
+    CONF_INTERACTION_MODE,
     CONF_IMAGE_MODEL,
     CONF_RECOMMENDED,
     DOMAIN,
     RECOMMENDED_AI_TASK_OPTIONS,
     RECOMMENDED_CHAT_MODEL,
+    SUBENTRY_CONVERSATION,
     RECOMMENDED_IMAGE_GENERATION_MODEL,
 )
 
@@ -66,9 +70,13 @@ async def test_user_flow_creates_ai_task_subentry(
 
     assert result["type"] == FlowResultType.CREATE_ENTRY
     entry = result["result"]
-    assert any(
-        s.subentry_type == "ai_task_data" for s in entry.subentries.values()
+    kinds = {s.subentry_type for s in entry.subentries.values()}
+    assert {"ai_task_data", "conversation", "tts", "stt"} <= kinds
+    conversation_sub = next(
+        s for s in entry.subentries.values() if s.subentry_type == "conversation"
     )
+    assert conversation_sub.title == "xAI Grok"
+    assert conversation_sub.data["inherit_entry_options"] is True
 
 
 async def test_ai_task_subentry_create_and_reconfigure(
@@ -264,3 +272,114 @@ async def test_validate_input_closes_client_on_cancellation(
         with pytest.raises(CancelledError):
             await validate_input(hass, {CONF_API_KEY: "sk-test"})
     assert client.close.await_count == 1
+
+
+async def test_migrated_agents_do_not_share_a_device(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Conversation, TTS, and STT each get a device. Sensors stay on the account."""
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+    sensors = [
+        entity
+        for entity in ent_reg.entities.values()
+        if entity.domain == "sensor" and entity.config_entry_id == mock_config_entry.entry_id
+    ]
+    assert sensors
+    account = dev_reg.async_get(sensors[0].device_id)
+    assert account is not None
+    assert (DOMAIN, mock_config_entry.entry_id) in account.identifiers
+    assert account.model == "Grok"
+    assert all(entity.device_id == account.id for entity in sensors)
+    assert hass.states.get("sensor.xai_grok_estimated_cost") is not None
+    assert hass.states.get("sensor.xai_grok_last_model") is not None
+
+    by_type = {
+        subentry.subentry_type: subentry
+        for subentry in mock_config_entry.subentries.values()
+    }
+    device_ids = {account.id}
+    for platform, kind in (
+        ("conversation", "conversation"),
+        ("tts", "tts"),
+        ("stt", "stt"),
+    ):
+        subentry = by_type[kind]
+        entity_id = ent_reg.async_get_entity_id(platform, DOMAIN, subentry.subentry_id)
+        assert entity_id is not None
+        entity = ent_reg.async_get(entity_id)
+        assert entity is not None
+        assert entity.config_subentry_id == subentry.subentry_id
+        device = dev_reg.async_get(entity.device_id)
+        assert device is not None
+        assert (DOMAIN, subentry.subentry_id) in device.identifiers
+        assert device.id not in device_ids
+        device_ids.add(device.id)
+        if platform != "conversation":
+            assert entity.original_name == subentry.title
+
+    legacy = conversation.async_get_agent(hass, mock_config_entry.entry_id)
+    assert legacy is not None
+    assert legacy.unique_id == by_type["conversation"].subentry_id
+
+
+async def test_second_conversation_agent_uses_its_own_model(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A second conversation subentry is another agent on the same API key."""
+    with patch(
+        "custom_components.grok_conversation.config_flow.async_list_chat_models",
+        return_value=[RECOMMENDED_CHAT_MODEL, "grok-4.5"],
+    ):
+        result = await hass.config_entries.subentries.async_init(
+            (mock_config_entry.entry_id, SUBENTRY_CONVERSATION),
+            context={"source": SOURCE_USER},
+        )
+        assert result["type"] == FlowResultType.FORM
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"],
+            {
+                CONF_NAME: "Kitchen Grok",
+                CONF_CHAT_MODEL: "grok-4.5",
+                CONF_INTERACTION_MODE: "chat_only",
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    ent_reg = er.async_get(hass)
+    agents = [
+        entity
+        for entity in ent_reg.entities.values()
+        if entity.domain == "conversation"
+        and entity.config_entry_id == mock_config_entry.entry_id
+    ]
+    assert len(agents) == 2
+    assert any(
+        sub.title == "Kitchen Grok" for sub in mock_config_entry.subentries.values()
+    )
+    kitchen_sub = next(
+        sub
+        for sub in mock_config_entry.subentries.values()
+        if sub.title == "Kitchen Grok"
+    )
+    assert kitchen_sub.data[CONF_CHAT_MODEL] == "grok-4.5"
+    assert kitchen_sub.data["inherit_entry_options"] is False
+    kitchen_entity = ent_reg.async_get_entity_id(
+        "conversation", DOMAIN, kitchen_sub.subentry_id
+    )
+    assert kitchen_entity is not None
+    device = dr.async_get(hass).async_get(ent_reg.async_get(kitchen_entity).device_id)
+    assert device is not None
+    assert device.model == "grok-4.5"
+    # The original agent remains the one registered for the config entry id.
+    legacy = conversation.async_get_agent(hass, mock_config_entry.entry_id)
+    original = next(
+        sub
+        for sub in mock_config_entry.subentries.values()
+        if sub.subentry_type == "conversation" and sub.title != "Kitchen Grok"
+    )
+    assert legacy.unique_id == original.subentry_id

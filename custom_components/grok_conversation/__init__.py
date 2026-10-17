@@ -25,7 +25,13 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
-from homeassistant.helpers import config_validation as cv, issue_registry as ir, selector
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+    selector,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
@@ -41,6 +47,7 @@ from .api_helpers import (
     map_xai_error,
 )
 from .const import (
+    ACCOUNT_DEVICE_MODEL,
     CONF_BUDGET_WARN_USD,
     CONF_CHAT_MODEL,
     CONF_FALLBACK_MODEL,
@@ -58,6 +65,11 @@ from .const import (
     CONF_VISION_MODEL,
     DEFAULT_AI_TASK_NAME,
     DOMAIN,
+    STT_DEVICE_MODEL,
+    SUBENTRY_CONVERSATION,
+    SUBENTRY_STT,
+    SUBENTRY_TTS,
+    TTS_DEVICE_MODEL,
     IMAGE_ASPECT_RATIOS,
     IMAGE_QUALITIES,
     IMAGE_RESOLUTIONS,
@@ -84,12 +96,15 @@ from .const import (
     SERVICE_QUERY_IMAGE,
     SERVICE_RECHECK_VOICE,
     SERVICE_RESET_STATS,
+    conversation_subentry_data,
     remap_retired_chat_model,
+    stt_subentry_data,
+    tts_subentry_data,
 )
 from .entity import resolve_vision_model
 from .usage import UsageTracker, imagine_estimate_usd
 from .voice_api import async_validate_voice_access
-from .voice_const import CONF_VOICE_ACCESS
+from .voice_const import CONF_ENABLE_STT, CONF_VOICE_ACCESS
 
 PLATFORMS = (
     Platform.AI_TASK,
@@ -1103,6 +1118,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: GrokConfigEntry) -> bool:
     """Set up Grok Conversation from a config entry."""
+    # A later options change can turn STT on after the v5 migration.
+    # Direct setup of an entry that is not registered yet cannot add subentries.
+    if hass.config_entries.async_get_entry(entry.entry_id) is entry:
+        _ensure_agent_subentries(hass, entry)
     api_key = entry.data[CONF_API_KEY]
     probe = create_xai_client(api_key, timeout=PROBE_TIMEOUT_SECONDS)
     try:
@@ -1182,6 +1201,162 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if tracker is not None:
             await tracker.async_flush()
     return unload_ok
+
+
+def _entry_title(entry: ConfigEntry) -> str:
+    """Title used for the migrated conversation agent."""
+    return entry.title or "xAI Grok"
+
+
+def _add_subentry_if_missing(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    subentry_type: str,
+    title: str,
+    data: dict[str, Any],
+) -> ConfigSubentry:
+    """Return the subentry of this type, creating it from current options."""
+    existing = next(
+        (
+            sub
+            for sub in entry.subentries.values()
+            if sub.subentry_type == subentry_type
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    created = ConfigSubentry(
+        data=MappingProxyType(data),
+        subentry_type=subentry_type,
+        title=title,
+        unique_id=None,
+    )
+    hass.config_entries.async_add_subentry(entry, created)
+    return entry.subentries[created.subentry_id]
+
+
+def _ensure_agent_subentries(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Create conversation, TTS, and STT subentries from the entry options.
+
+    STT is skipped when the user turned it off. TTS is always stored; the
+    TTS platform still honors enable_tts when it creates entities.
+    """
+    options = dict(entry.options)
+    title = _entry_title(entry)
+    _add_subentry_if_missing(
+        hass,
+        entry,
+        SUBENTRY_CONVERSATION,
+        title,
+        conversation_subentry_data(options, inherit=True),
+    )
+    _add_subentry_if_missing(
+        hass,
+        entry,
+        SUBENTRY_TTS,
+        f"{title} TTS",
+        tts_subentry_data(options, inherit=True),
+    )
+    if options.get(CONF_ENABLE_STT, True):
+        _add_subentry_if_missing(
+            hass,
+            entry,
+            SUBENTRY_STT,
+            f"{title} STT",
+            stt_subentry_data(options, inherit=True),
+        )
+
+
+def _retarget_agent_entity(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    *,
+    platform: str,
+    old_unique_id: str,
+    subentry: ConfigSubentry,
+    model: str,
+) -> None:
+    """Point an existing entity at its subentry without changing entity_id."""
+    ent_reg = er.async_get(hass)
+    entity_id = ent_reg.async_get_entity_id(platform, DOMAIN, old_unique_id)
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=subentry.subentry_id,
+        identifiers={(DOMAIN, subentry.subentry_id)},
+        name=subentry.title,
+        manufacturer="xAI",
+        model=model,
+        entry_type=dr.DeviceEntryType.SERVICE,
+    )
+    if entity_id is None:
+        return
+    ent_reg.async_update_entity(
+        entity_id,
+        new_unique_id=subentry.subentry_id,
+        config_subentry_id=subentry.subentry_id,
+        device_id=device.id,
+    )
+
+
+def _retarget_agent_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Move conversation, TTS, and STT off the shared account device."""
+    dev_reg = dr.async_get(hass)
+    account = dev_reg.async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
+    )
+    if account is not None and account.model != ACCOUNT_DEVICE_MODEL:
+        dev_reg.async_update_device(account.id, model=ACCOUNT_DEVICE_MODEL)
+
+    conversation = next(
+        (
+            sub
+            for sub in entry.subentries.values()
+            if sub.subentry_type == SUBENTRY_CONVERSATION
+        ),
+        None,
+    )
+    if conversation is not None:
+        chat_model = str(
+            conversation.data.get(CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL)
+        )
+        _retarget_agent_entity(
+            hass,
+            entry,
+            platform=Platform.CONVERSATION,
+            old_unique_id=entry.entry_id,
+            subentry=conversation,
+            model=chat_model,
+        )
+
+    tts = next(
+        (sub for sub in entry.subentries.values() if sub.subentry_type == SUBENTRY_TTS),
+        None,
+    )
+    if tts is not None:
+        _retarget_agent_entity(
+            hass,
+            entry,
+            platform=Platform.TTS,
+            old_unique_id=f"{entry.entry_id}_tts",
+            subentry=tts,
+            model=TTS_DEVICE_MODEL,
+        )
+
+    stt = next(
+        (sub for sub in entry.subentries.values() if sub.subentry_type == SUBENTRY_STT),
+        None,
+    )
+    if stt is not None:
+        _retarget_agent_entity(
+            hass,
+            entry,
+            platform=Platform.STT,
+            old_unique_id=f"{entry.entry_id}_stt",
+            subentry=stt,
+            model=STT_DEVICE_MODEL,
+        )
 
 
 def _add_ai_task_subentry(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -1276,6 +1451,11 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # opt-out. Do not restore Assist. New entries still store the API at
         # creation, and an explicit ["none"] opt-out is left as stored.
         hass.config_entries.async_update_entry(entry, minor_version=4)
+
+    if entry.version == 1 and entry.minor_version < 5:
+        _ensure_agent_subentries(hass, entry)
+        _retarget_agent_entities(hass, entry)
+        hass.config_entries.async_update_entry(entry, minor_version=5)
 
     LOGGER.debug(
         "Migration to version %s.%s successful",

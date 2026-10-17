@@ -43,6 +43,7 @@ from .const import (
     CONF_FAST_MODEL,
     CONF_HOME_CONTEXT,
     CONF_IMAGE_MODEL,
+    CONF_INHERIT_ENTRY_OPTIONS,
     CONF_INTERACTION_MODE,
     CONF_LIVE_SEARCH,
     CONF_LOCATION_CONTEXT,
@@ -59,6 +60,10 @@ from .const import (
     DEFAULT_AI_TASK_NAME,
     DOMAIN,
     GROK_SYSTEM_PROMPT,
+    INTERACTION_MODE_OPTIONS,
+    SUBENTRY_CONVERSATION,
+    SUBENTRY_STT,
+    SUBENTRY_TTS,
     MODE_CHAT_ONLY,
     MODE_TOOLS,
     RECOMMENDED_AI_TASK_OPTIONS,
@@ -84,9 +89,13 @@ from .const import (
     RETIRED_MODELS,
     RETIRED_VISION_MODELS,
     UNSUPPORTED_MODELS,
+    conversation_subentry_data,
+    effective_agent_options,
     effective_interaction_mode,
     effective_model_choice,
     pick_default_llm_api,
+    stt_subentry_data,
+    tts_subentry_data,
 )
 from .api_helpers import (
     PROBE_TIMEOUT_SECONDS,
@@ -191,7 +200,7 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Grok Conversation."""
 
     VERSION = 1
-    MINOR_VERSION = 4
+    MINOR_VERSION = 5
     _voice_chat_only_seen = False
 
     def _api_key_used_by_other_entry(
@@ -261,8 +270,9 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
             api_id = pick_default_llm_api(llm.async_get_apis(self.hass))
             if api_id:
                 options[CONF_LLM_HASS_API] = [api_id]
+            title = "xAI Grok"
             return self.async_create_entry(
-                title="xAI Grok",
+                title=title,
                 data={
                     **user_input,
                     CONF_VOICE_ACCESS: {
@@ -276,6 +286,24 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
                         "subentry_type": "ai_task_data",
                         "data": dict(RECOMMENDED_AI_TASK_OPTIONS),
                         "title": DEFAULT_AI_TASK_NAME,
+                        "unique_id": None,
+                    },
+                    {
+                        "subentry_type": SUBENTRY_CONVERSATION,
+                        "data": conversation_subentry_data(options, inherit=True),
+                        "title": title,
+                        "unique_id": None,
+                    },
+                    {
+                        "subentry_type": SUBENTRY_TTS,
+                        "data": tts_subentry_data(options, inherit=True),
+                        "title": f"{title} TTS",
+                        "unique_id": None,
+                    },
+                    {
+                        "subentry_type": SUBENTRY_STT,
+                        "data": stt_subentry_data(options, inherit=True),
+                        "title": f"{title} STT",
                         "unique_id": None,
                     },
                 ],
@@ -364,6 +392,9 @@ class OpenAIConfigFlow(ConfigFlow, domain=DOMAIN):
         """Return subentries supported by this integration."""
         return {
             "ai_task_data": GrokAITaskSubentryFlowHandler,
+            SUBENTRY_CONVERSATION: GrokConversationSubentryFlowHandler,
+            SUBENTRY_TTS: GrokTTSSubentryFlowHandler,
+            SUBENTRY_STT: GrokSTTSubentryFlowHandler,
         }
 
 
@@ -1072,3 +1103,319 @@ class GrokAITaskSubentryFlowHandler(ConfigSubentryFlow):
                 }
             )
         return step_schema
+
+
+def _language_select(languages: list[str]) -> SelectSelector:
+    """Dropdown of language codes."""
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=languages,
+            mode=SelectSelectorMode.DROPDOWN,
+        )
+    )
+
+
+def _voice_select() -> SelectSelector:
+    """Dropdown of built-in xAI voices."""
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=[
+                SelectOptionDict(value=vid, label=label)
+                for vid, label in sorted(
+                    XAI_VOICES.items(), key=lambda item: item[1].lower()
+                )
+            ],
+            mode=SelectSelectorMode.DROPDOWN,
+        )
+    )
+
+
+class _NamedSubentryFlow(ConfigSubentryFlow):
+    """Shared name and loaded-entry checks for agent subentries."""
+
+    options: dict[str, Any]
+
+    @property
+    def _is_new(self) -> bool:
+        """Return if this is a new subentry."""
+        return self.source == "user"
+
+    def _abort_if_unloaded(self) -> SubentryFlowResult | None:
+        """Abort when the parent entry is not loaded."""
+        from homeassistant.config_entries import ConfigEntryState
+
+        if self._get_entry().state is not ConfigEntryState.LOADED:
+            return self.async_abort(reason="entry_not_loaded")
+        return None
+
+
+class GrokConversationSubentryFlowHandler(_NamedSubentryFlow):
+    """Add or reconfigure a conversation agent on this API key."""
+
+    _chat_models: list[str] | None = None
+
+    async def _async_get_chat_models(self) -> list[str]:
+        """List chat models from xAI."""
+        if self._chat_models is not None:
+            return self._chat_models
+        entry = self._get_entry()
+        client = create_xai_client(
+            entry.data.get(CONF_API_KEY, ""), timeout=PROBE_TIMEOUT_SECONDS
+        )
+        try:
+            models = await async_list_chat_models(client)
+        finally:
+            await close_xai_client(client)
+        models = [model for model in models if model not in RETIRED_MODELS]
+        current = effective_model_choice(
+            self.options.get(CONF_CHAT_MODEL), RECOMMENDED_CHAT_MODEL
+        )
+        if current and current not in models and is_chat_model_id(current):
+            models = [current, *models]
+        self._chat_models = models
+        return models
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add a conversation agent."""
+        self.options = dict(self._get_entry().options)
+        return await self.async_step_init()
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Change an existing conversation agent."""
+        entry = self._get_entry()
+        subentry = self._get_reconfigure_subentry()
+        self.options = effective_agent_options(entry.options, subentry.data)
+        self.options[CONF_NAME] = subentry.title
+        return await self.async_step_init()
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Edit the agent name, model, prompt, and interaction mode."""
+        if aborted := self._abort_if_unloaded():
+            return aborted
+
+        errors: dict[str, str] = {}
+        chat_models = await self._async_get_chat_models()
+        if user_input is not None:
+            model_val = user_input.get(CONF_CHAT_MODEL)
+            if model_val and model_val in RETIRED_CHAT_MODELS:
+                errors[CONF_CHAT_MODEL] = "model_retired"
+            elif model_val and (
+                model_val in UNSUPPORTED_MODELS or not is_chat_model_id(str(model_val))
+            ):
+                errors[CONF_CHAT_MODEL] = "model_not_supported"
+            if not errors:
+                return self._save_conversation(user_input)
+
+        chat_default = effective_model_choice(
+            self.options.get(CONF_CHAT_MODEL), RECOMMENDED_CHAT_MODEL
+        )
+        name_default = self.options.get(CONF_NAME) or "Grok"
+        prompt_default = self.options.get(CONF_PROMPT, GROK_SYSTEM_PROMPT)
+        mode_default = self.options.get(
+            CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NAME, default=name_default): str,
+                vol.Optional(
+                    CONF_CHAT_MODEL,
+                    description={"suggested_value": chat_default},
+                    default=chat_default,
+                ): _model_select(chat_models, chat_default, RECOMMENDED_CHAT_MODEL),
+                vol.Optional(
+                    CONF_PROMPT,
+                    description={"suggested_value": prompt_default},
+                    default=prompt_default,
+                ): TextSelector(TextSelectorConfig(multiline=True)),
+                vol.Optional(
+                    CONF_INTERACTION_MODE,
+                    description={"suggested_value": mode_default},
+                    default=mode_default,
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=INTERACTION_MODE_OPTIONS,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    def _save_conversation(self, user_input: dict[str, Any]) -> SubentryFlowResult:
+        """Store the agent, keeping the original one tied to entry options."""
+        name = str(user_input.get(CONF_NAME) or "Grok")
+        updates = {
+            CONF_CHAT_MODEL: user_input.get(CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL),
+            CONF_PROMPT: user_input.get(CONF_PROMPT, GROK_SYSTEM_PROMPT),
+            CONF_INTERACTION_MODE: user_input.get(
+                CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
+            ),
+        }
+        entry = self._get_entry()
+        if self._is_new:
+            data = conversation_subentry_data(entry.options, inherit=False)
+            data.update(updates)
+            return self.async_create_entry(title=name, data=data)
+
+        subentry = self._get_reconfigure_subentry()
+        if subentry.data.get(CONF_INHERIT_ENTRY_OPTIONS):
+            self.hass.config_entries.async_update_entry(
+                entry, options={**entry.options, **updates}
+            )
+            data = {**subentry.data, **updates, CONF_INHERIT_ENTRY_OPTIONS: True}
+        else:
+            data = {**dict(subentry.data), **updates}
+            data[CONF_INHERIT_ENTRY_OPTIONS] = False
+        return self.async_update_and_abort(entry, subentry, title=name, data=data)
+
+
+class GrokTTSSubentryFlowHandler(_NamedSubentryFlow):
+    """Add or reconfigure a TTS engine on this API key."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add a TTS engine."""
+        self.options = dict(self._get_entry().options)
+        return await self.async_step_init()
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Change an existing TTS engine."""
+        entry = self._get_entry()
+        subentry = self._get_reconfigure_subentry()
+        self.options = effective_agent_options(entry.options, subentry.data)
+        self.options[CONF_NAME] = subentry.title
+        return await self.async_step_init()
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Edit the engine name, voice, language, and speed."""
+        if aborted := self._abort_if_unloaded():
+            return aborted
+        if user_input is not None:
+            return self._save_tts(user_input)
+
+        name_default = self.options.get(CONF_NAME) or "Grok TTS"
+        voice_default = self.options.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE)
+        language_default = self.options.get(CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE)
+        speed_default = self.options.get(CONF_TTS_SPEED, RECOMMENDED_TTS_SPEED)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NAME, default=name_default): str,
+                vol.Optional(
+                    CONF_TTS_VOICE, default=voice_default
+                ): _voice_select(),
+                vol.Optional(
+                    CONF_TTS_LANGUAGE, default=language_default
+                ): _language_select(list(TTS_LANGUAGES)),
+                vol.Optional(CONF_TTS_SPEED, default=speed_default): NumberSelector(
+                    NumberSelectorConfig(min=0.5, max=2.0, step=0.1)
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
+
+    def _save_tts(self, user_input: dict[str, Any]) -> SubentryFlowResult:
+        """Store the TTS engine."""
+        name = str(user_input.pop(CONF_NAME, None) or "Grok TTS")
+        updates = {
+            CONF_TTS_VOICE: user_input.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE),
+            CONF_TTS_LANGUAGE: user_input.get(
+                CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE
+            ),
+            CONF_TTS_SPEED: user_input.get(CONF_TTS_SPEED, RECOMMENDED_TTS_SPEED),
+        }
+        entry = self._get_entry()
+        if self._is_new:
+            data = tts_subentry_data(entry.options, inherit=False)
+            data.update(updates)
+            return self.async_create_entry(title=name, data=data)
+        subentry = self._get_reconfigure_subentry()
+        if subentry.data.get(CONF_INHERIT_ENTRY_OPTIONS):
+            self.hass.config_entries.async_update_entry(
+                entry, options={**entry.options, **updates}
+            )
+            data = {**subentry.data, **updates, CONF_INHERIT_ENTRY_OPTIONS: True}
+        else:
+            data = {**dict(subentry.data), **updates}
+            data[CONF_INHERIT_ENTRY_OPTIONS] = False
+        return self.async_update_and_abort(entry, subentry, title=name, data=data)
+
+
+class GrokSTTSubentryFlowHandler(_NamedSubentryFlow):
+    """Add or reconfigure an STT engine on this API key."""
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Add an STT engine."""
+        self.options = dict(self._get_entry().options)
+        return await self.async_step_init()
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Change an existing STT engine."""
+        entry = self._get_entry()
+        subentry = self._get_reconfigure_subentry()
+        self.options = effective_agent_options(entry.options, subentry.data)
+        self.options[CONF_NAME] = subentry.title
+        return await self.async_step_init()
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Edit the engine name and language."""
+        if aborted := self._abort_if_unloaded():
+            return aborted
+        if user_input is not None:
+            return self._save_stt(user_input)
+
+        name_default = self.options.get(CONF_NAME) or "Grok STT"
+        language_default = self.options.get(CONF_STT_LANGUAGE, RECOMMENDED_STT_LANGUAGE)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NAME, default=name_default): str,
+                vol.Optional(
+                    CONF_STT_LANGUAGE, default=language_default
+                ): _language_select(list(STT_LANGUAGES)),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
+
+    def _save_stt(self, user_input: dict[str, Any]) -> SubentryFlowResult:
+        """Store the STT engine."""
+        name = str(user_input.pop(CONF_NAME, None) or "Grok STT")
+        updates = {
+            CONF_STT_LANGUAGE: user_input.get(
+                CONF_STT_LANGUAGE, RECOMMENDED_STT_LANGUAGE
+            ),
+        }
+        entry = self._get_entry()
+        if self._is_new:
+            data = stt_subentry_data(entry.options, inherit=False)
+            data.update(updates)
+            return self.async_create_entry(title=name, data=data)
+        subentry = self._get_reconfigure_subentry()
+        if subentry.data.get(CONF_INHERIT_ENTRY_OPTIONS):
+            self.hass.config_entries.async_update_entry(
+                entry, options={**entry.options, **updates}
+            )
+            data = {**subentry.data, **updates, CONF_INHERIT_ENTRY_OPTIONS: True}
+        else:
+            data = {**dict(subentry.data), **updates}
+            data[CONF_INHERIT_ENTRY_OPTIONS] = False
+        return self.async_update_and_abort(entry, subentry, title=name, data=data)

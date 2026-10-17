@@ -11,13 +11,18 @@ from homeassistant.components.tts import (
     TtsAudioType,
     Voice,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    SUBENTRY_TTS,
+    TTS_DEVICE_MODEL,
+    effective_agent_options,
+)
 from .exceptions import raise_translated_xai_error
 from .voice_api import XAIVoiceError, async_list_voices, async_tts
 from .voice_const import (
@@ -41,9 +46,17 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up xAI TTS entity from a config entry."""
+    """Set up xAI TTS entities from TTS subentries."""
     if not config_entry.options.get("enable_tts", True):
         _LOGGER.debug("xAI TTS disabled in options")
+        return
+
+    subentries = [
+        subentry
+        for subentry in config_entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TTS
+    ]
+    if not subentries:
         return
 
     session = async_get_clientsession(hass)
@@ -59,43 +72,55 @@ async def async_setup_entry(
         "tts_voices"
     ] = voices
 
-    async_add_entities([XAIGrokTTSEntity(config_entry, voices)])
+    for subentry in subentries:
+        async_add_entities(
+            [XAIGrokTTSEntity(config_entry, subentry, voices)],
+            config_subentry_id=subentry.subentry_id,
+        )
 
 
 class XAIGrokTTSEntity(TextToSpeechEntity):
     """xAI TTS engine (appears in Assist → Text-to-speech)."""
 
-    # Standalone name — avoid "Grok xAI Grok" from device + entity name concat
+    # OpenAI TTS keeps has_entity_name off and uses the subentry title,
+    # so the voice picker shows the name the user chose.
     _attr_has_entity_name = False
-    _attr_name = "xAI TTS"
     _attr_supported_options = [ATTR_VOICE]
 
     def __init__(
-        self, config_entry: ConfigEntry, voices: dict[str, str]
+        self,
+        config_entry: ConfigEntry,
+        subentry: ConfigSubentry,
+        voices: dict[str, str],
     ) -> None:
         self._entry = config_entry
+        self._subentry = subentry
         self._voices_map = voices
-        self._attr_unique_id = f"{config_entry.entry_id}_tts"
+        self._attr_name = subentry.title
+        self._attr_unique_id = subentry.subentry_id
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, config_entry.entry_id)},
-            name=config_entry.title or "xAI Grok",
+            identifiers={(DOMAIN, subentry.subentry_id)},
+            name=subentry.title,
             manufacturer="xAI",
-            model="xAI Voice TTS",
+            model=TTS_DEVICE_MODEL,
             entry_type=DeviceEntryType.SERVICE,
         )
+        options = self._options()
         # Assist language dropdown
         self._attr_supported_languages = list(TTS_LANGUAGES)
-        default_lang = config_entry.options.get(
-            CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE
-        )
+        default_lang = options.get(CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE)
         if default_lang not in self._attr_supported_languages:
             default_lang = RECOMMENDED_TTS_LANGUAGE
         self._attr_default_language = default_lang
 
+    def _options(self) -> dict[str, Any]:
+        """Voice settings for this engine."""
+        return effective_agent_options(self._entry.options, self._subentry.data)
+
     @property
     def default_options(self) -> dict[str, Any]:
         """Default voice for Assist UI / Try voice."""
-        voice = self._entry.options.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE)
+        voice = self._options().get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE)
         if voice not in self._voices_map:
             voice = next(iter(self._voices_map), RECOMMENDED_TTS_VOICE)
         return {ATTR_VOICE: voice}
@@ -103,7 +128,7 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
     @callback
     def async_get_supported_voices(self, language: str) -> list[Voice]:
         """Voices for the Assist voice dropdown (all xAI voices are multilingual)."""
-        default = self._entry.options.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE)
+        default = self._options().get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE)
         items = [
             Voice(vid, label) for vid, label in sorted(self._voices_map.items(), key=lambda x: x[1].lower())
         ]
@@ -115,17 +140,15 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
         self, message: str, language: str, options: dict[str, Any]
     ) -> TtsAudioType:
         """Generate MP3 audio via xAI /v1/tts."""
+        stored = self._options()
         voice_id = options.get(
             ATTR_VOICE,
-            self._entry.options.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE),
+            stored.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE),
         )
-        speed = float(
-            self._entry.options.get(CONF_TTS_SPEED, RECOMMENDED_TTS_SPEED)
-        )
+        speed = float(stored.get(CONF_TTS_SPEED, RECOMMENDED_TTS_SPEED))
         # Prefer Assist-selected language; fall back to integration default
         lang = normalize_tts_language(
-            language
-            or self._entry.options.get(CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE)
+            language or stored.get(CONF_TTS_LANGUAGE, RECOMMENDED_TTS_LANGUAGE)
         )
         api_key = self._entry.data.get("api_key", "")
         session = async_get_clientsession(self.hass)

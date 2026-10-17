@@ -1,6 +1,8 @@
 """Constants for the Grok Conversation integration."""
 
+from collections.abc import Mapping
 import logging
+from typing import Any
 
 DOMAIN = "grok_conversation"
 LOGGER = logging.getLogger(__package__)
@@ -157,6 +159,46 @@ RECOMMENDED_AUTO_MODEL_ROUTING = True
 RECOMMENDED_HOME_CONTEXT = False
 RECOMMENDED_BUDGET_WARN_USD = 0.0  # 0 = disabled
 
+# Subentry types. AI Task already uses ai_task_data.
+SUBENTRY_CONVERSATION = "conversation"
+SUBENTRY_TTS = "tts"
+SUBENTRY_STT = "stt"
+
+# When true, the original agent reads the config entry options so the
+# existing options flow keeps driving it. Extra agents store their own data.
+CONF_INHERIT_ENTRY_OPTIONS = "inherit_entry_options"
+
+# Account device shared by the usage sensors. Conversation, TTS, and STT
+# each use their own subentry device, so this model no longer races them.
+ACCOUNT_DEVICE_MODEL = "Grok"
+TTS_DEVICE_MODEL = "xAI Voice TTS"
+STT_DEVICE_MODEL = "xAI Voice STT"
+
+CONVERSATION_OPTION_KEYS = (
+    CONF_RECOMMENDED,
+    CONF_PROMPT,
+    CONF_CHAT_MODEL,
+    CONF_FAST_MODEL,
+    CONF_FALLBACK_MODEL,
+    CONF_VISION_MODEL,
+    CONF_LIVE_SEARCH,
+    CONF_SHOW_CITATIONS,
+    CONF_SEND_USER_NAME,
+    CONF_LOCATION_CONTEXT,
+    CONF_INTERACTION_MODE,
+    CONF_VOICE_OPTIMIZED,
+    CONF_AUTO_MODEL_ROUTING,
+    CONF_HOME_CONTEXT,
+    CONF_MAX_TOKENS,
+    CONF_TEMPERATURE,
+    CONF_TOP_P,
+    CONF_REASONING_EFFORT,
+    "llm_hass_api",
+)
+
+TTS_OPTION_KEYS = ("tts_voice", "tts_language", "tts_speed")
+STT_OPTION_KEYS = ("stt_language",)
+
 UNSUPPORTED_MODELS: list[str] = []
 
 # Image generation constants (xai-sdk 1.19.0 ImageAspectRatio / ImageQuality).
@@ -250,6 +292,49 @@ def prompt_for_interaction(mode: str | None, stored: str | None) -> str | None:
     if stored.strip() != GROK_SYSTEM_PROMPT.strip():
         return stored
     return GROK_CHAT_ONLY_PROMPT
+
+
+def slice_options(source: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    """Copy the keys that belong on one kind of agent subentry."""
+    return {key: source[key] for key in keys if key in source}
+
+
+def conversation_subentry_data(
+    options: Mapping[str, Any], *, inherit: bool
+) -> dict[str, Any]:
+    """Settings stored on a conversation subentry."""
+    data = slice_options(options, CONVERSATION_OPTION_KEYS)
+    data[CONF_INHERIT_ENTRY_OPTIONS] = inherit
+    return data
+
+
+def tts_subentry_data(options: Mapping[str, Any], *, inherit: bool) -> dict[str, Any]:
+    """Settings stored on a TTS subentry."""
+    data = slice_options(options, TTS_OPTION_KEYS)
+    data[CONF_INHERIT_ENTRY_OPTIONS] = inherit
+    return data
+
+
+def stt_subentry_data(options: Mapping[str, Any], *, inherit: bool) -> dict[str, Any]:
+    """Settings stored on an STT subentry."""
+    data = slice_options(options, STT_OPTION_KEYS)
+    data[CONF_INHERIT_ENTRY_OPTIONS] = inherit
+    return data
+
+
+def effective_agent_options(
+    entry_options: Mapping[str, Any], subentry_data: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return the settings a subentry agent should use.
+
+    The migrated agent keeps ``inherit_entry_options`` so the options flow
+    remains the editor. An agent added later stores its own copy.
+    """
+    data = dict(subentry_data)
+    if data.get(CONF_INHERIT_ENTRY_OPTIONS):
+        return dict(entry_options)
+    data.pop(CONF_INHERIT_ENTRY_OPTIONS, None)
+    return data
 
 
 def active_llm_api_ids(stored: object) -> list[str]:

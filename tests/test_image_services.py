@@ -704,7 +704,7 @@ async def test_migrate_entry_rewrites_retired_vision_and_fast(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert entry.options[CONF_VISION_MODEL] == RECOMMENDED_VISION_MODEL
     assert entry.options[CONF_FAST_MODEL] == RECOMMENDED_FAST_MODEL
     assert entry.options[CONF_FALLBACK_MODEL] == RECOMMENDED_FALLBACK_MODEL
@@ -753,7 +753,7 @@ async def test_migrate_entry_without_vision_model(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert CONF_VISION_MODEL not in entry.options or entry.options.get(
         CONF_VISION_MODEL
     ) not in RETIRED_VISION_MODELS
@@ -907,7 +907,7 @@ async def test_migrate_minor_2_to_3_preserves_ai_task_subentry(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     ai_tasks = [
         s for s in entry.subentries.values() if s.subentry_type == "ai_task_data"
     ]
@@ -950,7 +950,7 @@ async def test_migrate_minor_2_deleted_ai_task_stays_deleted(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert not any(s.subentry_type == "ai_task_data" for s in entry.subentries.values())
     assert entry.options[CONF_FAST_MODEL] == RECOMMENDED_FAST_MODEL
 
@@ -1000,7 +1000,7 @@ async def test_migrate_multiple_ai_task_subentries(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     ai_tasks = [
         s for s in entry.subentries.values() if s.subentry_type == "ai_task_data"
     ]
@@ -1045,14 +1045,21 @@ async def test_migrate_entry_idempotent(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert dict(entry.options) == options_before
-    assert {sid: dict(s.data) for sid, s in entry.subentries.items()} == sub_before
+    ai_after = next(
+        s for s in entry.subentries.values() if s.subentry_type == "ai_task_data"
+    )
+    assert dict(ai_after.data) == sub_before[ai_after.subentry_id]
+    assert any(s.subentry_type == "conversation" for s in entry.subentries.values())
+    assert any(s.subentry_type == "tts" for s in entry.subentries.values())
+    assert any(s.subentry_type == "stt" for s in entry.subentries.values())
+    sub_after = {sid: dict(s.data) for sid, s in entry.subentries.items()}
 
     assert await async_migrate_entry(hass, entry)
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert dict(entry.options) == options_before
-    assert {sid: dict(s.data) for sid, s in entry.subentries.items()} == sub_before
+    assert {sid: dict(s.data) for sid, s in entry.subentries.items()} == sub_after
 
 
 async def test_migrate_rejects_major_version_2(
@@ -1112,7 +1119,7 @@ async def test_migrate_each_retired_vision_id(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert entry.options[CONF_VISION_MODEL] == RECOMMENDED_VISION_MODEL
     assert entry.options["keep_me"] == retired_id
     assert entry.options[CONF_CHAT_MODEL] == RECOMMENDED_CHAT_MODEL
@@ -1165,7 +1172,7 @@ async def test_migrate_each_retired_chat_id(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert entry.options[option_key] == recommended
     assert entry.options["keep_me"] is True
     # Other model keys that were already recommended stay put
@@ -1213,7 +1220,7 @@ async def test_migrate_each_retired_chat_id_on_ai_task_subentry(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     ai_task = next(
         s for s in entry.subentries.values() if s.subentry_type == "ai_task_data"
     )
