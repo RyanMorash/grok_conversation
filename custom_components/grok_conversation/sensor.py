@@ -18,6 +18,8 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 from .usage import UsageTracker
 
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
