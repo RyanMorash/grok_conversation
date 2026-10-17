@@ -46,7 +46,6 @@ from .const import (
     DOMAIN,
     LOGGER,
     MODE_CHAT_ONLY,
-    MODE_PIPELINE,
     RECOMMENDED_AUTO_MODEL_ROUTING,
     RECOMMENDED_CHAT_MODEL,
     RECOMMENDED_FALLBACK_MODEL,
@@ -62,6 +61,7 @@ from .const import (
     RECOMMENDED_VOICE_OPTIMIZED,
     VOICE_OPTIMIZED_SUFFIX,
     active_llm_api_ids,
+    effective_interaction_mode,
     prompt_for_interaction,
     remap_retired_chat_model,
 )
@@ -226,8 +226,8 @@ class OpenAIConversationEntity(
         )
 
     def _update_control_feature(self) -> None:
-        mode = self.entry.options.get(
-            CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
+        mode = effective_interaction_mode(
+            self.entry.options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
         )
         api_ids = active_llm_api_ids(self.entry.options.get(CONF_LLM_HASS_API))
         if mode == MODE_CHAT_ONLY or not api_ids:
@@ -429,49 +429,6 @@ class OpenAIConversationEntity(
                 return fast or primary
         return primary
 
-    async def _try_pipeline(
-        self, user_input: conversation.ConversationInput
-    ) -> conversation.ConversationResult | None:
-        """Try built-in Home Assistant conversation agent first."""
-        try:
-            result = await conversation.async_converse(
-                self.hass,
-                text=user_input.text,
-                conversation_id=None,
-                context=user_input.context,
-                language=user_input.language,
-                agent_id="conversation.home_assistant",
-                device_id=user_input.device_id,
-            )
-        except Exception as err:  # noqa: BLE001
-            LOGGER.debug("Pipeline HA agent failed: %s", err)
-            return None
-
-        speech = ""
-        if result and result.response:
-            speech = result.response.speech.get("plain", {}).get("speech", "")
-            if not speech and hasattr(result.response, "as_dict"):
-                data = result.response.as_dict()
-                speech = (
-                    data.get("speech", {}).get("plain", {}).get("speech", "") or ""
-                )
-        if not speech:
-            return None
-        lowered = speech.lower()
-        fallback_markers = (
-            "sorry",
-            "i am not aware",
-            "i'm not aware",
-            "don't know",
-            "do not know",
-            "no intent",
-            "not sure how",
-            "can you rephrase",
-        )
-        if any(m in lowered for m in fallback_markers):
-            return None
-        return result
-
     # Long spoken replies without prewarmed TTS: don't open the mic early (#31)
     _SATELLITE_LONG_REPLY_CHARS = 280
 
@@ -607,7 +564,9 @@ class OpenAIConversationEntity(
     ) -> conversation.ConversationResult:
         """Inner method that handles the actual conversation logic."""
         options = self.entry.options
-        mode = options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
+        mode = effective_interaction_mode(
+            options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
+        )
 
         LOGGER.debug(
             "Grok handling message mode=%s device_id=%s text=%s",
@@ -615,13 +574,6 @@ class OpenAIConversationEntity(
             user_input.device_id,
             user_input.text,
         )
-
-        # Intelligent pipeline: HA intent first
-        if mode == MODE_PIPELINE:
-            piped = await self._try_pipeline(user_input)
-            if piped is not None:
-                LOGGER.debug("Served via HA intent pipeline")
-                return piped
 
         # Chat-only: disable LLM HASS API tools
         llm_api_option = (
@@ -681,8 +633,7 @@ class OpenAIConversationEntity(
         )
 
         # Live search via one chat.create when possible. Previously this was
-        # skipped whenever HA tools were present (#26). Pipeline mode uses an
-        # inverted heuristic (#30): deny-list only.
+        # skipped whenever HA tools were present (#26).
         use_search = should_use_live_search(
             user_input.text,
             interaction_mode=mode,
