@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from voluptuous_openapi import convert
+import probatio
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
@@ -17,11 +17,6 @@ from homeassistant.helpers import device_registry as dr, llm
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import slugify
 from homeassistant.util.json import json_loads
-
-try:
-    import probatio
-except ImportError:  # pragma: no cover - HA < 2026.8 may lack probatio
-    probatio = None  # type: ignore[assignment]
 
 from .api_helpers import (
     ChatResult,
@@ -205,14 +200,11 @@ def format_tool(
     """Format tool specification for xAI / OpenAI-compatible function calling."""
     serializer = custom_serializer or llm.selector_serializer
     try:
-        if probatio is not None:
-            raw_schema = probatio.to_openapi(
-                tool.parameters,
-                custom_serializer=serializer,
-                openapi_version="3.1.0",
-            )
-        else:
-            raw_schema = convert(tool.parameters, custom_serializer=serializer)
+        raw_schema = probatio.to_openapi(
+            tool.parameters,
+            custom_serializer=serializer,
+            openapi_version="3.1.0",
+        )
     except Exception as err:  # noqa: BLE001
         LOGGER.warning(
             "Failed to convert schema for tool %s (%s); using empty object schema",
@@ -266,26 +258,16 @@ def _adjust_strict_schema(schema: dict[str, Any]) -> None:
 
 
 def format_structured_output(
-    structure: Any, llm_api: llm.APIInstance | None
+    structure: probatio.Schema, llm_api: llm.APIInstance | None
 ) -> dict[str, Any]:
-    """Convert a structure schema for xAI json_schema response_format.
-
-    HA 2026.7 used voluptuous (+ voluptuous_openapi). HA 2026.8+ uses
-    probatio.Schema. Support both so we stay compatible with the declared
-    min version and current core.
-    """
-    serializer = (
-        llm_api.custom_serializer if llm_api else llm.selector_serializer
+    """Convert a probatio structure schema to xAI json_schema response_format."""
+    raw_schema = probatio.to_openapi(
+        structure,
+        custom_serializer=(
+            llm_api.custom_serializer if llm_api else llm.selector_serializer
+        ),
+        openapi_version="3.1.0",
     )
-    raw_schema: Any
-    if probatio is not None and isinstance(structure, probatio.Schema):
-        raw_schema = probatio.to_openapi(
-            structure,
-            custom_serializer=serializer,
-            openapi_version="3.1.0",
-        )
-    else:
-        raw_schema = convert(structure, custom_serializer=serializer)
 
     if not isinstance(raw_schema, dict):
         raise HomeAssistantError(
@@ -684,7 +666,7 @@ class GrokBaseLLMEntity(Entity):
         self,
         chat_log: conversation.ChatLog,
         *,
-        structure: Any | None = None,
+        structure: probatio.Schema | None = None,
         structure_name: str | None = None,
         max_iterations: int = MAX_TOOL_ITERATIONS,
         model: str | None = None,

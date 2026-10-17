@@ -20,8 +20,7 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/braytonstafford/grok_conversation/issues",
   "requirements": [
-    "xai-sdk==1.19.0",
-    "voluptuous-openapi"
+    "xai-sdk==1.19.0"
   ],
   "version": "1.11.0"
 }
