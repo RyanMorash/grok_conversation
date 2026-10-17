@@ -60,7 +60,6 @@ from .const import (
     DOMAIN,
     GROK_SYSTEM_PROMPT,
     MODE_CHAT_ONLY,
-    MODE_PIPELINE,
     MODE_TOOLS,
     RECOMMENDED_AI_TASK_OPTIONS,
     RECOMMENDED_AI_TASK_MAX_TOKENS,
@@ -85,6 +84,7 @@ from .const import (
     RETIRED_MODELS,
     RETIRED_VISION_MODELS,
     UNSUPPORTED_MODELS,
+    effective_interaction_mode,
     effective_model_choice,
     pick_default_llm_api,
 )
@@ -616,11 +616,11 @@ def openai_config_option_schema(
     ]
     mode_opts = [
         SelectOptionDict(value=MODE_TOOLS, label="Tool Control (default)"),
-        SelectOptionDict(
-            value=MODE_PIPELINE, label="Intelligent Pipeline (HA intent → Grok)"
-        ),
         SelectOptionDict(value=MODE_CHAT_ONLY, label="Chat Only (no device control)"),
     ]
+    shown_mode = effective_interaction_mode(
+        options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
+    )
 
     chat_default = effective_model_choice(
         options.get(CONF_CHAT_MODEL), RECOMMENDED_CHAT_MODEL
@@ -669,12 +669,8 @@ def openai_config_option_schema(
         ): SelectSelector(SelectSelectorConfig(options=hass_apis, multiple=True)),
         vol.Optional(
             CONF_INTERACTION_MODE,
-            description={
-                "suggested_value": options.get(
-                    CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE
-                )
-            },
-            default=options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE),
+            description={"suggested_value": shown_mode},
+            default=shown_mode,
         ): SelectSelector(
             SelectSelectorConfig(
                 options=mode_opts, mode=SelectSelectorMode.DROPDOWN

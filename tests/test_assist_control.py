@@ -13,6 +13,7 @@ from homeassistant.config_entries import SOURCE_USER
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.grok_conversation.config_flow import RECOMMENDED_OPTIONS
+from custom_components.grok_conversation.api_helpers import should_use_live_search
 from custom_components.grok_conversation.const import (
     CONF_INTERACTION_MODE,
     CONF_PROMPT,
@@ -20,9 +21,9 @@ from custom_components.grok_conversation.const import (
     GROK_CHAT_ONLY_PROMPT,
     GROK_SYSTEM_PROMPT,
     MODE_CHAT_ONLY,
-    MODE_PIPELINE,
     MODE_TOOLS,
     RECOMMENDED_AI_TASK_OPTIONS,
+    effective_interaction_mode,
     pick_default_llm_api,
     prompt_for_interaction,
 )
@@ -64,8 +65,12 @@ def test_prompt_for_interaction_replaces_only_stock_chat_only_prompt() -> None:
     custom = "Answer in haiku."
     assert prompt_for_interaction(MODE_CHAT_ONLY, custom) == custom
     assert prompt_for_interaction(MODE_TOOLS, GROK_SYSTEM_PROMPT) == GROK_SYSTEM_PROMPT
-    assert prompt_for_interaction(MODE_PIPELINE, GROK_SYSTEM_PROMPT) == (
-        GROK_SYSTEM_PROMPT
+    assert effective_interaction_mode("pipeline") == MODE_TOOLS
+    assert (
+        prompt_for_interaction(
+            effective_interaction_mode("pipeline"), GROK_SYSTEM_PROMPT
+        )
+        == GROK_SYSTEM_PROMPT
     )
     assert prompt_for_interaction(MODE_CHAT_ONLY, None) is None
 
@@ -153,7 +158,7 @@ async def test_migration_leaves_other_modes_and_stored_apis(hass: HomeAssistant)
     pipeline = _entry(
         {
             **dict(RECOMMENDED_OPTIONS),
-            CONF_INTERACTION_MODE: MODE_PIPELINE,
+            CONF_INTERACTION_MODE: "pipeline",
         }
     )
     already = _entry(
@@ -261,6 +266,119 @@ async def test_tools_entry_exposes_control_feature(hass: HomeAssistant) -> None:
     agent = conversation.async_get_agent(hass, entry.entry_id)
     assert agent is not None
     assert agent.supported_features & conversation.ConversationEntityFeature.CONTROL
+
+
+async def test_stored_pipeline_exposes_control_like_tools(
+    hass: HomeAssistant,
+) -> None:
+    """A saved pipeline value keeps Assist control when an LLM API is stored."""
+    entry = _entry(
+        {
+            **dict(RECOMMENDED_OPTIONS),
+            CONF_INTERACTION_MODE: "pipeline",
+            CONF_LLM_HASS_API: ["assist"],
+        },
+        minor_version=4,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+    assert agent is not None
+    assert agent.supported_features & conversation.ConversationEntityFeature.CONTROL
+    assert entry.options[CONF_INTERACTION_MODE] == "pipeline"
+
+
+def _interaction_mode_field(data_schema):
+    """Return the options-form marker and selector for interaction mode."""
+    for key, selector in data_schema.schema.items():
+        if getattr(key, "schema", None) == CONF_INTERACTION_MODE:
+            return key, selector
+    raise AssertionError("interaction_mode missing from options schema")
+
+
+async def test_options_form_drops_pipeline_choice(hass: HomeAssistant) -> None:
+    """The options form offers tools and chat-only, and shows tools for pipeline."""
+    entry = _entry(
+        {
+            **dict(RECOMMENDED_OPTIONS),
+            CONF_INTERACTION_MODE: "pipeline",
+        },
+        minor_version=4,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == FlowResultType.FORM
+    key, selector = _interaction_mode_field(result["data_schema"])
+    values = [option["value"] for option in selector.config["options"]]
+    assert values == [MODE_TOOLS, MODE_CHAT_ONLY]
+    assert key.description["suggested_value"] == MODE_TOOLS
+    assert key.default() == MODE_TOOLS
+
+
+async def test_stored_pipeline_does_not_call_builtin_agent(
+    hass: HomeAssistant,
+) -> None:
+    """Pipeline runs the tools path and does not ask the built-in agent."""
+    entry = _entry(
+        {
+            **dict(RECOMMENDED_OPTIONS),
+            CONF_INTERACTION_MODE: "pipeline",
+            CONF_LLM_HASS_API: ["assist"],
+            CONF_PROMPT: GROK_SYSTEM_PROMPT,
+        },
+        minor_version=4,
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+    assert agent is not None
+    chat_log = ChatLog(hass=hass, conversation_id=entry.entry_id)
+    chat_log.async_add_user_content(
+        conversation.UserContent(content="Sorry, I am not sure how")
+    )
+    user_input = conversation.ConversationInput(
+        text="Sorry, I am not sure how",
+        context=Context(),
+        conversation_id=entry.entry_id,
+        device_id=None,
+        satellite_id=None,
+        language="en",
+        agent_id=agent.entity_id,
+    )
+    provided: dict = {}
+
+    async def _provide(llm_context, llm_api, prompt, extra) -> None:
+        provided["llm_api"] = llm_api
+        provided["prompt"] = prompt
+
+    chat_log.async_provide_llm_data = _provide  # type: ignore[method-assign]
+    builtin = AsyncMock()
+    with (
+        patch(
+            "custom_components.grok_conversation.conversation.conversation.async_converse",
+            builtin,
+        ),
+        patch(
+            "custom_components.grok_conversation.conversation.should_use_live_search",
+            wraps=should_use_live_search,
+        ) as search,
+        patch.object(agent, "_async_chat_log_turn", new=AsyncMock()),
+        patch.object(agent, "_async_result_from_log", new=AsyncMock()),
+    ):
+        await agent._async_handle_message_inner(user_input, chat_log)  # noqa: SLF001
+
+    assert builtin.await_count == 0
+    assert provided["llm_api"] == ["assist"]
+    assert "ALWAYS use Home Assistant tools" in provided["prompt"]
+    assert search.call_args.kwargs["interaction_mode"] == MODE_TOOLS
+    assert entry.options[CONF_INTERACTION_MODE] == "pipeline"
 
 
 async def test_chat_only_does_not_expose_control_feature(hass: HomeAssistant) -> None:
