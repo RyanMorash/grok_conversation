@@ -142,13 +142,21 @@ async def test_migrate_adds_ai_task_subentry(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert any(
         s.subentry_type == "ai_task_data" for s in entry.subentries.values()
     )
     assert dict(entry.options) == options_before
+    conversation_sub = next(
+        s for s in entry.subentries.values() if s.subentry_type == "conversation"
+    )
     assert (
-        registry.async_get_entity_id("conversation", DOMAIN, entry.entry_id)
+        registry.async_get_entity_id("conversation", DOMAIN, entry.entry_id) is None
+    )
+    assert (
+        registry.async_get_entity_id(
+            "conversation", DOMAIN, conversation_sub.subentry_id
+        )
         == conv_before
     )
 

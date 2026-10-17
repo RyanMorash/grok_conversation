@@ -167,9 +167,9 @@ async def test_migration_leaves_other_modes_and_stored_apis(hass: HomeAssistant)
         assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    assert chat_only.minor_version == 4
-    assert pipeline.minor_version == 4
-    assert already.minor_version == 4
+    assert chat_only.minor_version == 5
+    assert pipeline.minor_version == 5
+    assert already.minor_version == 5
     assert CONF_LLM_HASS_API not in chat_only.options
     assert CONF_LLM_HASS_API not in pipeline.options
     assert already.options[CONF_LLM_HASS_API] == ["calendar"]
@@ -188,7 +188,7 @@ async def test_pre_v4_cleared_tools_entry_is_not_restored(hass: HomeAssistant) -
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    assert entry.minor_version == 4
+    assert entry.minor_version == 5
     assert CONF_LLM_HASS_API not in entry.options
     agent = conversation.async_get_agent(hass, entry.entry_id)
     assert agent is not None
