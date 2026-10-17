@@ -63,7 +63,7 @@ MAX_TOOL_ITERATIONS = 10
 
 
 def _strip_json_from_response(response: str) -> str:
-    """Strip JSON objects from the end of LLM responses."""
+    """Drop a trailing JSON object from free-text AI Task output."""
     if not response:
         return response
     last_brace_index = response.rfind("{")
@@ -883,11 +883,11 @@ class GrokBaseLLMEntity(Entity):
         skip_json_strip: bool,
     ) -> str:
         """Replay buffered text deltas. Tool-call turns never reach this."""
-        text = raw_text if skip_json_strip else _strip_json_from_response(raw_text)
-        if deltas and "".join(deltas) == raw_text and text == raw_text:
+        # Spoken streams keep the model text, including a trailing JSON object.
+        if deltas and "".join(deltas) == raw_text:
             pieces = [piece for piece in deltas if piece]
         else:
-            pieces = [text] if text else []
+            pieces = [raw_text] if raw_text else []
         if citation_text:
             pieces.append(citation_text)
         full = "".join(pieces)
@@ -1140,11 +1140,12 @@ class GrokBaseLLMEntity(Entity):
                     skip_json_strip=skip_json_strip,
                 )
             else:
-                full_response = (
-                    raw_text
-                    if skip_json_strip
-                    else _strip_json_from_response(raw_text)
-                )
+                # Conversation speaks the model text. Structured AI Task sets
+                # skip_json_strip and parses the object instead of speaking it.
+                if service == "conversation" or skip_json_strip:
+                    full_response = raw_text
+                else:
+                    full_response = _strip_json_from_response(raw_text)
                 if full_response or skip_json_strip:
                     async for _ in chat_log.async_add_assistant_content(
                         conversation.AssistantContent(
