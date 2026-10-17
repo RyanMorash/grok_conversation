@@ -6,7 +6,7 @@ One HACS install → **Conversation agent**, **Speech-to-text**, **Text-to-speec
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/braytonstafford/grok_conversation)
 [![GitHub release](https://img.shields.io/github/v/release/braytonstafford/grok_conversation)](https://github.com/braytonstafford/grok_conversation/releases)
-[![HA](https://img.shields.io/badge/Home%20Assistant-2026.7%2B-blue)](https://www.home-assistant.io/)
+[![HA](https://img.shields.io/badge/Home%20Assistant-2026.10%2B-blue)](https://www.home-assistant.io/)
 
 ---
 
