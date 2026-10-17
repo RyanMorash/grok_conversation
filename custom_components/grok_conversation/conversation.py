@@ -72,10 +72,6 @@ from .entity import (
 )
 from .exceptions import TokenLengthExceededError
 
-# Spoken Assist turns stop the chat stream here. The shared client timeout
-# stays at 120 seconds so AI Task is unchanged.
-SATELLITE_STREAM_TIMEOUT_SECONDS = 45.0
-
 # Room names ("family room", "guest bedroom") and shopping lists are not
 # presence requests. Require an explicit people or presence question.
 # Short words use boundaries so "personal" and "train" do not count.
@@ -699,9 +695,6 @@ class OpenAIConversationEntity(
                 live_search, return_citations=show_citations_effective
             )
 
-        stream_timeout = (
-            SATELLITE_STREAM_TIMEOUT_SECONDS if user_input.device_id else None
-        )
         instructed = (
             _merge_system_note(messages, "\n\n".join(search_system))
             if search_parameters is not None
@@ -720,7 +713,6 @@ class OpenAIConversationEntity(
                     fallback_model=fallback_model,
                     search_parameters=search_parameters,
                     stream_final=True,
-                    stream_timeout=stream_timeout,
                     append_citations=show_citations_effective,
                 )
             except CombinedSearchRejected as err:
@@ -761,7 +753,6 @@ class OpenAIConversationEntity(
                 fallback_model=fallback_model,
                 search_parameters=search_parameters,
                 stream_final=True,
-                stream_timeout=stream_timeout,
                 append_citations=bool(
                     show_citations_effective and search_parameters is not None
                 ),
@@ -874,7 +865,6 @@ class OpenAIConversationEntity(
         fallback_model: str | None,
         search_parameters: Any | None = None,
         stream_final: bool = False,
-        stream_timeout: float | None = None,
         append_citations: bool = False,
     ) -> None:
         """Run the shared tool loop and map xAI errors."""
@@ -889,7 +879,6 @@ class OpenAIConversationEntity(
                 fallback_model=fallback_model,
                 search_parameters=search_parameters,
                 stream_final=stream_final,
-                stream_timeout=stream_timeout,
                 append_citations=append_citations,
             )
         except HomeAssistantError:

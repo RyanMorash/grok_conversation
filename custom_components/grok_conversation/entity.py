@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -27,6 +26,7 @@ from .api_helpers import (
     XAIError,
     XAIInvalidArgumentError,
     XAIRateLimitError,
+    _tool_calls_from_response,
     async_chat_completion,
     async_chat_stream,
     chat_result_from_response,
@@ -75,6 +75,48 @@ def _strip_json_from_response(response: str) -> str:
         return response[:last_brace_index].strip()
     except json.JSONDecodeError:
         return response
+
+
+def _committed_stream_text(raw: str) -> str:
+    """Return the prefix a trailing-JSON strip cannot remove.
+
+    Text before the last ``{`` can be spoken as it arrives. The brace and
+    anything after it stay buffered until the turn ends. Trailing whitespace
+    stays buffered too, because a brace in a later chunk would strip it.
+    """
+    brace = raw.rfind("{")
+    if brace == -1:
+        return raw.rstrip()
+    return raw[:brace].rstrip()
+
+
+def _merge_streamed_tool_call(current: ChatToolCall, update: ChatToolCall) -> None:
+    """Fold a later tool-call delta into the call still being assembled."""
+    if update.name and not current.name:
+        current.name = update.name
+    incoming = update.arguments or ""
+    if not incoming or incoming == "{}":
+        return
+    existing = current.arguments or ""
+    if not existing or existing == "{}":
+        current.arguments = incoming
+        return
+    if incoming.startswith(existing):
+        current.arguments = incoming
+        return
+    if existing.startswith(incoming):
+        return
+    current.arguments += incoming
+
+
+class _StreamTurn:
+    """Tokens and finish reason captured while a chat stream is consumed."""
+
+    def __init__(self) -> None:
+        self.finish_reason = "stop"
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.had_tool_calls = False
 
 
 def sanitize_tool_schema(schema: Any) -> dict[str, Any]:
@@ -677,7 +719,6 @@ class GrokBaseLLMEntity(Entity):
         fallback_model: str | None = None,
         search_parameters: Any | None = None,
         stream_final: bool = False,
-        stream_timeout: float | None = None,
         append_citations: bool = False,
     ) -> None:
         """Run chat completions + tool loop. Does not depend on ConversationInput."""
@@ -750,7 +791,6 @@ class GrokBaseLLMEntity(Entity):
                     skip_json_strip=structure is not None,
                     search_parameters=search_parameters,
                     stream_final=stream_final,
-                    stream_timeout=stream_timeout,
                     append_citations=append_citations,
                 )
                 return
@@ -786,11 +826,34 @@ class GrokBaseLLMEntity(Entity):
             ) from last_error
         raise HomeAssistantError(f"Error talking to xAI: {last_error}") from last_error
 
+    def _streamed_tool_delta(
+        self,
+        pending: dict[str, ChatToolCall],
+        emitted_ids: set[str],
+        key: str,
+        call: ChatToolCall,
+    ) -> llm.ToolInput | None:
+        """Return a tool input once its arguments are a JSON object."""
+        if key in emitted_ids:
+            return None
+        current = pending.get(key)
+        if current is None:
+            pending[key] = ChatToolCall(
+                id=call.id, name=call.name, arguments=call.arguments
+            )
+        else:
+            _merge_streamed_tool_call(current, call)
+        ha_calls, parse_errors = self._tool_calls_to_ha([pending[key]])
+        if parse_errors:
+            return None
+        emitted_ids.add(key)
+        pending.pop(key)
+        return ha_calls[0]
+
     async def _async_stream_completion(
         self,
         client: Any,
         *,
-        stream_timeout: float | None,
         model: str,
         messages: list[dict[str, Any]],
         max_tokens: int | None,
@@ -802,11 +865,26 @@ class GrokBaseLLMEntity(Entity):
         user: str | None,
         response_format: dict[str, Any] | None,
         search_parameters: Any | None,
-    ) -> tuple[ChatResult, list[str], bool]:
-        """Buffer ``chat.stream()`` until it ends or the deadline passes."""
-        deltas: list[str] = []
-        response: Any = None
-        timed_out = False
+        skip_json_strip: bool,
+        append_citations: bool,
+        saved_citations: list[Any],
+        turn: _StreamTurn,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield chat-log deltas as ``chat.stream()`` chunks arrive.
+
+        Text is yielded as each chunk arrives. Tool-call deltas are yielded
+        in the same stream once their arguments are a JSON object, so the
+        chat log can run the tool before the turn is finished. Trailing JSON
+        is still stripped from a final spoken reply.
+        """
+        pieces: list[str] = []
+        emitted = ""
+        started = False
+        hold_json = not skip_json_strip
+        had_tool_calls = False
+        pending: dict[str, ChatToolCall] = {}
+        emitted_ids: set[str] = set()
+        last_result: ChatResult | None = None
         stream = async_chat_stream(
             client,
             model=model,
@@ -821,34 +899,55 @@ class GrokBaseLLMEntity(Entity):
             response_format=response_format,
             search_parameters=search_parameters,
         )
+
+        def _text_delta(piece: str) -> dict[str, Any]:
+            nonlocal emitted, started
+            emitted += piece
+            if not started:
+                started = True
+                return {"role": "assistant", "content": piece}
+            return {"content": piece}
+
+        def _unsent(source: str, *, hold: bool) -> str:
+            target = source if not hold else _committed_stream_text(source)
+            if not target.startswith(emitted):
+                return ""
+            return target[len(emitted) :]
+
         try:
-            loop = asyncio.get_running_loop()
-            deadline = (
-                None if stream_timeout is None else loop.time() + stream_timeout
-            )
-            while True:
-                if deadline is None:
-                    try:
-                        response, chunk = await anext(stream)
-                    except StopAsyncIteration:
-                        break
-                else:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        timed_out = True
-                        break
-                    try:
-                        response, chunk = await asyncio.wait_for(
-                            anext(stream), remaining
-                        )
-                    except TimeoutError:
-                        timed_out = True
-                        break
-                    except StopAsyncIteration:
-                        break
+            async for response, chunk in stream:
+                last_result = chat_result_from_response(response)
                 piece = getattr(chunk, "content", None) or ""
                 if piece:
-                    deltas.append(str(piece))
+                    pieces.append(str(piece))
+                source = "".join(pieces)
+                extra = _unsent(source, hold=hold_json)
+                if extra:
+                    yield _text_delta(extra)
+
+                ready: list[llm.ToolInput] = []
+                indexed = _tool_calls_from_response(chunk)
+                indexed.extend(_tool_calls_from_response(response))
+                for index, call in enumerate(indexed):
+                    key = call.id or f"call-{index}"
+                    tool_input = self._streamed_tool_delta(
+                        pending, emitted_ids, key, call
+                    )
+                    if tool_input is not None:
+                        ready.append(tool_input)
+                if not ready:
+                    continue
+                had_tool_calls = True
+                if hold_json:
+                    hold_json = False
+                    held = _unsent(source, hold=False)
+                    if held:
+                        yield _text_delta(held)
+                if not started:
+                    started = True
+                    yield {"role": "assistant", "tool_calls": ready}
+                else:
+                    yield {"tool_calls": ready}
         finally:
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:
@@ -857,62 +956,63 @@ class GrokBaseLLMEntity(Entity):
                 except Exception:  # noqa: BLE001
                     LOGGER.debug("Closing chat stream failed", exc_info=True)
 
-        if response is None:
-            result = ChatResult(content="".join(deltas))
-        else:
-            result = chat_result_from_response(response)
-            if not result.content and deltas:
-                result = ChatResult(
-                    content="".join(deltas),
-                    tool_calls=result.tool_calls,
-                    finish_reason=result.finish_reason,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                    citations=list(result.citations),
+        source = "".join(pieces)
+        if not source and last_result is not None and last_result.content:
+            source = last_result.content
+        if last_result is not None:
+            turn.finish_reason = last_result.finish_reason
+            turn.prompt_tokens = last_result.prompt_tokens
+            turn.completion_tokens = last_result.completion_tokens
+            if (had_tool_calls or pending) and last_result.citations:
+                saved_citations[:] = list(last_result.citations)
+        turn.had_tool_calls = had_tool_calls or bool(pending)
+
+        if had_tool_calls or pending:
+            held = _unsent(source, hold=False)
+            if held:
+                yield _text_delta(held)
+            if not pending:
+                return
+            external: list[llm.ToolInput] = []
+            errors: list[tuple[ChatToolCall, dict[str, Any]]] = []
+            for call in pending.values():
+                _ha_calls, parse_errors = self._tool_calls_to_ha([call])
+                payload = parse_errors.get(call.id) or {
+                    "error": "Invalid tool arguments JSON",
+                    "raw_arguments": call.arguments,
+                }
+                external.append(
+                    llm.ToolInput(
+                        id=call.id,
+                        tool_name=call.name,
+                        tool_args={},
+                        external=True,
+                    )
                 )
-        return result, deltas, timed_out
+                errors.append((call, payload))
+            if not started:
+                started = True
+                yield {"role": "assistant", "tool_calls": external}
+            else:
+                yield {"tool_calls": external}
+            for call, payload in errors:
+                yield {
+                    "role": "tool_result",
+                    "tool_call_id": call.id,
+                    "tool_name": call.name,
+                    "result": llm.ToolResult(data=payload),
+                }
+            return
 
-    async def _async_add_streamed_text(
-        self,
-        chat_log: conversation.ChatLog,
-        *,
-        agent_id: str,
-        raw_text: str,
-        deltas: list[str],
-        citation_text: str,
-        skip_json_strip: bool,
-    ) -> str:
-        """Replay buffered text deltas. Tool-call turns never reach this."""
-        text = raw_text if skip_json_strip else _strip_json_from_response(raw_text)
-        if deltas and "".join(deltas) == raw_text and text == raw_text:
-            pieces = [piece for piece in deltas if piece]
-        else:
-            pieces = [text] if text else []
-        if citation_text:
-            pieces.append(citation_text)
-        full = "".join(pieces)
-        if not pieces:
-            if skip_json_strip:
-                async for _ in chat_log.async_add_assistant_content(
-                    conversation.AssistantContent(agent_id=agent_id, content=full)
-                ):
-                    pass
-            return full
-
-        async def _deltas():
-            started = False
-            for piece in pieces:
-                if not piece:
-                    continue
-                if not started:
-                    yield {"role": "assistant", "content": piece}
-                    started = True
-                else:
-                    yield {"content": piece}
-
-        async for _ in chat_log.async_add_delta_content_stream(agent_id, _deltas()):
-            pass
-        return full
+        spoken = source if skip_json_strip else _strip_json_from_response(source)
+        if append_citations:
+            citation_source = saved_citations or (
+                last_result.citations if last_result is not None else []
+            )
+            spoken = f"{spoken}{format_citations(citation_source)}"
+        extra = _unsent(spoken, hold=False)
+        if extra:
+            yield _text_delta(extra)
 
     async def _async_tool_loop(
         self,
@@ -930,7 +1030,6 @@ class GrokBaseLLMEntity(Entity):
         skip_json_strip: bool,
         search_parameters: Any | None = None,
         stream_final: bool = False,
-        stream_timeout: float | None = None,
         append_citations: bool = False,
     ) -> None:
         """Run chat completion tool iterations for one model."""
@@ -1016,15 +1115,44 @@ class GrokBaseLLMEntity(Entity):
             }
             try:
                 if stream_final:
-                    result, deltas, timed_out = await self._async_stream_completion(
-                        client,
-                        stream_timeout=stream_timeout,
-                        **completion_kwargs,
+                    turn = _StreamTurn()
+                    added: list[dict[str, Any]] = []
+                    async for content in chat_log.async_add_delta_content_stream(
+                        agent_id,
+                        self._async_stream_completion(
+                            client,
+                            skip_json_strip=skip_json_strip,
+                            append_citations=append_citations,
+                            saved_citations=saved_citations,
+                            turn=turn,
+                            **completion_kwargs,
+                        ),
+                    ):
+                        added.extend(convert_content_to_param(content))
+                    if working_messages is not None:
+                        working_messages.extend(added)
+                    await self._record_usage(
+                        model,
+                        turn.prompt_tokens,
+                        turn.completion_tokens,
+                        service=service,
                     )
-                else:
-                    result = await async_chat_completion(client, **completion_kwargs)
-                    deltas = []
-                    timed_out = False
+                    if chat_log.unresponded_tool_results:
+                        continue
+                    chat_log.async_trace(
+                        {
+                            "stats": {
+                                "input_tokens": turn.prompt_tokens,
+                                "output_tokens": turn.completion_tokens,
+                            }
+                        }
+                    )
+                    if turn.finish_reason == "length":
+                        raise TokenLengthExceededError(
+                            options.get(CONF_MAX_TOKENS, default_max_tokens)
+                        )
+                    break
+                result = await async_chat_completion(client, **completion_kwargs)
             except XAIRateLimitError:
                 raise
             except (XAIAuthError, XAIConnectionError):
@@ -1040,19 +1168,6 @@ class GrokBaseLLMEntity(Entity):
                 raise
             except XAIError:
                 raise
-
-            if timed_out:
-                LOGGER.debug(
-                    "Stopped chat stream after %.0f seconds",
-                    stream_timeout or 0,
-                )
-                result = ChatResult(
-                    content=result.content,
-                    finish_reason="stop",
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                )
-                deltas = [result.content] if result.content else []
 
             p_tok, c_tok = result.prompt_tokens, result.completion_tokens
 
@@ -1125,33 +1240,16 @@ class GrokBaseLLMEntity(Entity):
                 continue
 
             raw_text = result.content or ""
-            if stream_final:
-                citation_text = ""
-                if append_citations:
-                    citation_text = format_citations(
-                        saved_citations or result.citations
+            full_response = (
+                raw_text if skip_json_strip else _strip_json_from_response(raw_text)
+            )
+            if full_response or skip_json_strip:
+                async for _ in chat_log.async_add_assistant_content(
+                    conversation.AssistantContent(
+                        agent_id=agent_id, content=full_response
                     )
-                full_response = await self._async_add_streamed_text(
-                    chat_log,
-                    agent_id=agent_id,
-                    raw_text=raw_text,
-                    deltas=deltas,
-                    citation_text=citation_text,
-                    skip_json_strip=skip_json_strip,
-                )
-            else:
-                full_response = (
-                    raw_text
-                    if skip_json_strip
-                    else _strip_json_from_response(raw_text)
-                )
-                if full_response or skip_json_strip:
-                    async for _ in chat_log.async_add_assistant_content(
-                        conversation.AssistantContent(
-                            agent_id=agent_id, content=full_response
-                        )
-                    ):
-                        pass
+                ):
+                    pass
             if full_response or skip_json_strip:
                 if working_messages is not None:
                     working_messages.append(
