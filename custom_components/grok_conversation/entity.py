@@ -207,11 +207,11 @@ def format_tool(
         )
     except Exception as err:  # noqa: BLE001
         LOGGER.warning(
-            "Failed to convert schema for tool %s (%s); using empty object schema",
+            "Failed to convert schema for tool %s: %s",
             tool.name,
             err,
         )
-        raw_schema = {"type": "object", "properties": {}}
+        raise
 
     schema = sanitize_tool_schema(raw_schema)
     return {
