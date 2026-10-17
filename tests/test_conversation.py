@@ -224,7 +224,7 @@ async def test_rate_limit_does_not_use_fallback(
         {"role": "system", "content": "You are helpful."},
         {"role": "user", "content": "Hi"},
     ]
-    with pytest.raises(HomeAssistantError, match="Rate limited or insufficient funds"):
+    with pytest.raises(HomeAssistantError) as caught:
         await entity._async_handle_chat_log(  # noqa: SLF001
             chat_log,
             model="grok-4.3-latest",
@@ -237,6 +237,8 @@ async def test_rate_limit_does_not_use_fallback(
             service="conversation",
             fallback_model="grok-4.6",
         )
+    assert caught.value.translation_key == "rate_limit"
+    assert "quota" not in str(caught.value)
 
     assert mock_xai_client.chat.create.call_count == 1
 

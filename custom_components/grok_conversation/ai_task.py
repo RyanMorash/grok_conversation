@@ -18,6 +18,7 @@ from .const import (
     remap_retired_chat_model,
 )
 from .entity import GrokBaseLLMEntity, model_supports_vision
+from .exceptions import raise_translated_xai_error
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigSubentry
@@ -81,8 +82,7 @@ class GrokAITaskEntity(ai_task.AITaskEntity, GrokBaseLLMEntity):
         except HomeAssistantError:
             raise
         except Exception as err:
-            LOGGER.error("Error in AI Task generate_data: %s", err, exc_info=True)
-            raise HomeAssistantError(f"Error talking to xAI: {err}") from err
+            raise_translated_xai_error(err)
 
         if not isinstance(chat_log.content[-1], conversation.AssistantContent):
             raise HomeAssistantError(

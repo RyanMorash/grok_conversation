@@ -55,7 +55,11 @@ from .const import (
     RETIRED_VISION_MODELS,
     remap_retired_chat_model,
 )
-from .exceptions import TokenLengthExceededError
+from .exceptions import (
+    CANNOT_CONNECT,
+    TokenLengthExceededError,
+    raise_translated_xai_error,
+)
 from .usage import UsageTracker
 
 # Max number of back and forth with the LLM to generate a response
@@ -780,11 +784,12 @@ class GrokBaseLLMEntity(Entity):
                 del chat_log.content[content_checkpoint:]
                 continue
 
-        if isinstance(last_error, XAIRateLimitError):
+        if last_error is None:
             raise HomeAssistantError(
-                "Rate limited or insufficient funds"
-            ) from last_error
-        raise HomeAssistantError(f"Error talking to xAI: {last_error}") from last_error
+                translation_domain=DOMAIN,
+                translation_key=CANNOT_CONNECT,
+            )
+        raise_translated_xai_error(last_error)
 
     async def _async_stream_completion(
         self,
@@ -1169,7 +1174,12 @@ class GrokBaseLLMEntity(Entity):
             await self._record_usage(model, p_tok, c_tok, service=service)
 
             if result.finish_reason == "length":
-                raise TokenLengthExceededError(
+                token_error = TokenLengthExceededError(
                     options.get(CONF_MAX_TOKENS, default_max_tokens)
                 )
+                LOGGER.error(
+                    "xAI reply exceeded the token limit (%s tokens)",
+                    token_error.token,
+                )
+                raise token_error
             break
