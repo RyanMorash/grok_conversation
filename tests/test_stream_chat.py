@@ -697,19 +697,20 @@ async def test_streamed_invalid_tool_json_is_not_executed(
     assert "Invalid tool arguments JSON" in _message_text(tool_msgs[0])
 
 
-async def test_streamed_reply_still_strips_trailing_json(
+async def test_streamed_reply_keeps_trailing_json(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_xai_client: MagicMock,
 ) -> None:
-    """A spoken stream still drops a trailing JSON object."""
+    """A spoken stream keeps a trailing JSON object from the model text."""
+    reply = 'Hello {"ok": true}'
     _install_streams(
         mock_xai_client,
         [
             _gen(
                 [
                     _pair("Hello "),
-                    _pair('{"ok": true}', content='Hello {"ok": true}'),
+                    _pair('{"ok": true}', content=reply),
                 ]
             )
         ],
@@ -719,8 +720,10 @@ async def test_streamed_reply_still_strips_trailing_json(
         mock_config_entry,
         "hello there friend",
     )
-    assert _speech(result) == "Hello"
-    assert all("ok" not in str(delta.get("content") or "") for delta in deltas)
+    assert _speech(result) == reply
+    assert '{"ok": true}' in "".join(
+        str(delta.get("content") or "") for delta in deltas
+    )
 
 
 async def test_satellite_reply_omits_citations(
@@ -753,3 +756,88 @@ async def test_satellite_reply_omits_citations(
     assert speech == "Sunny."
     assert "Sources:" not in speech
     assert all("Sources:" not in str(delta.get("content")) for delta in deltas)
+
+
+async def test_spoken_reply_keeps_trailing_json_object(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A spoken reply keeps a trailing JSON object from the model text."""
+    reply = 'The light is on. {"state": "on"}'
+    _install_streams(
+        mock_xai_client,
+        [
+            _gen(
+                [
+                    _pair("The light is on. "),
+                    _pair('{"state": "on"}', content=reply),
+                ]
+            )
+        ],
+    )
+    _agent, chat_log, result, deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "what is the light doing",
+    )
+    assert _speech(result) == reply
+    heard = "".join(str(delta.get("content") or "") for delta in deltas)
+    assert heard == reply
+    assert any(
+        isinstance(item, conversation.AssistantContent) and item.content == reply
+        for item in chat_log.content
+    )
+
+    only_json = '{"state": "on"}'
+    _install_streams(mock_xai_client, [_gen([_pair(only_json)])])
+    _agent, _log, result, deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "what is the light doing",
+    )
+    assert _speech(result) == only_json
+    assert "".join(str(delta.get("content") or "") for delta in deltas) == only_json
+
+
+async def test_legacy_search_keeps_trailing_json_object(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A rejected tools+search pass keeps trailing JSON in the note and reply."""
+    await _use_options(hass, mock_config_entry, **{CONF_LIVE_SEARCH: LIVE_SEARCH_WEB})
+    tool = _RecordingTool()
+    search_text = 'Score is 2-1. {"home": 2, "away": 1}'
+    final = 'Using the live fact. {"source": "web"}'
+    _install_streams(
+        mock_xai_client,
+        [
+            _raise_gen(
+                XAIInvalidArgumentError(
+                    "tools and search_parameters are not supported together"
+                )
+            )
+        ],
+    )
+    mock_xai_client.chat.create.return_value.sample = AsyncMock(
+        side_effect=[
+            _chat_response(search_text, citations=["https://example.com/fact"]),
+            _chat_response(final),
+        ]
+    )
+    _agent, _log, result, _deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "latest score",
+        tool=tool,
+    )
+
+    assert _speech(result) == final
+    tools_call = mock_xai_client.chat.create.call_args_list[2]
+    texts = [
+        _message_text(message)
+        for message in tools_call.kwargs["messages"]
+        if _message_role(message) == "system"
+    ]
+    assert any('{"home": 2, "away": 1}' in text for text in texts)

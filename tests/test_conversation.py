@@ -433,3 +433,34 @@ async def test_unconvertible_tool_schema_is_omitted_from_request(
     assert parameters["properties"]["action"]["type"] == "string"
     assert parameters != {"type": "object", "properties": {}}
     assert "Skipping tool broken_schema" in caplog.text
+
+
+async def test_sampled_conversation_keeps_trailing_json_object(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A non-streaming conversation turn keeps a trailing JSON object."""
+    entity = _conversation_entity(hass, mock_config_entry)
+    reply = 'The light is on. {"state": "on"}'
+    _set_sample(mock_xai_client, [_chat_response(reply)])
+
+    chat_log = ChatLog(hass=hass, conversation_id="conv-trailing-json")
+    chat_log.async_add_user_content(conversation.UserContent(content="Light status"))
+    await entity._async_handle_chat_log(  # noqa: SLF001
+        chat_log,
+        model="grok-4.3-latest",
+        options={CONF_CHAT_MODEL: "grok-4.3-latest"},
+        messages=[
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Light status"},
+        ],
+        agent_id=entity.entity_id,
+        service="conversation",
+        fallback_model="",
+    )
+
+    assert any(
+        isinstance(content, conversation.AssistantContent) and content.content == reply
+        for content in chat_log.content
+    )

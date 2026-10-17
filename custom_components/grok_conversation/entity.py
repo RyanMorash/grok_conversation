@@ -67,7 +67,7 @@ MAX_TOOL_ITERATIONS = 10
 
 
 def _strip_json_from_response(response: str) -> str:
-    """Strip JSON objects from the end of LLM responses."""
+    """Drop a trailing JSON object from free-text AI Task output."""
     if not response:
         return response
     last_brace_index = response.rfind("{")
@@ -879,8 +879,8 @@ class GrokBaseLLMEntity(Entity):
 
         Text is yielded as each chunk arrives. Tool-call deltas are yielded
         in the same stream once their arguments are a JSON object, so the
-        chat log can run the tool before the turn is finished. Trailing JSON
-        is still stripped from a final spoken reply.
+        chat log can run the tool before the turn is finished. A final spoken
+        reply keeps a trailing JSON object.
         """
         pieces: list[str] = []
         emitted = ""
@@ -1009,7 +1009,8 @@ class GrokBaseLLMEntity(Entity):
                 }
             return
 
-        spoken = source if skip_json_strip else _strip_json_from_response(source)
+        # Spoken streams keep the model text, including a trailing JSON object.
+        spoken = source
         if append_citations:
             citation_source = saved_citations or (
                 last_result.citations if last_result is not None else []
@@ -1250,9 +1251,12 @@ class GrokBaseLLMEntity(Entity):
                 continue
 
             raw_text = result.content or ""
-            full_response = (
-                raw_text if skip_json_strip else _strip_json_from_response(raw_text)
-            )
+            # Conversation speaks the model text. Structured AI Task sets
+            # skip_json_strip and parses the object instead of speaking it.
+            if service == "conversation" or skip_json_strip:
+                full_response = raw_text
+            else:
+                full_response = _strip_json_from_response(raw_text)
             if full_response or skip_json_strip:
                 async for _ in chat_log.async_add_assistant_content(
                     conversation.AssistantContent(

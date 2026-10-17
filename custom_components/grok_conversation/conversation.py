@@ -68,7 +68,6 @@ from .const import (
 from .entity import (
     GrokBaseLLMEntity,
     convert_content_to_param,
-    _strip_json_from_response,
 )
 from .exceptions import raise_translated_xai_error
 
@@ -757,7 +756,6 @@ class OpenAIConversationEntity(
                 show_citations=show_citations_effective,
                 reasoning_effort=options.get(CONF_REASONING_EFFORT),
             )
-            text = _strip_json_from_response(text)
             await self._record_usage(model, p_tok, c_tok, service="conversation")
 
             if text and not ha_tools_available:
