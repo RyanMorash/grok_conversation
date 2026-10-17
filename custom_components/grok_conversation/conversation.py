@@ -72,6 +72,8 @@ from .entity import (
 )
 from .exceptions import TokenLengthExceededError
 
+PARALLEL_UPDATES = 0
+
 # Spoken Assist turns stop the chat stream here. The shared client timeout
 # stays at 120 seconds so AI Task is unchanged.
 SATELLITE_STREAM_TIMEOUT_SECONDS = 45.0
