@@ -23,6 +23,25 @@ _TIMEOUT_SHORT = ClientTimeout(total=20)
 _TIMEOUT_TTS = ClientTimeout(total=60)
 _TIMEOUT_STT = ClientTimeout(total=120)
 
+# https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
+# sample_rate is shared. bit_rate is MP3 only.
+_TTS_SAMPLE_RATES = frozenset({8000, 16000, 22050, 24000, 44100, 48000})
+_TTS_MP3_BIT_RATES = frozenset({32000, 64000, 96000, 128000, 192000})
+_DEFAULT_TTS_SAMPLE_RATE = 24000
+_DEFAULT_TTS_BIT_RATE = 128000
+
+# Assist preferred format → xAI codec. ``raw`` is PCM, matching OpenAI.
+# ogg, oga, and opus are not codecs on the xAI page.
+_PREFERRED_TO_CODEC = {
+    "mp3": "mp3",
+    "wav": "wav",
+    "pcm": "pcm",
+    "raw": "pcm",
+    "mulaw": "mulaw",
+    "ulaw": "ulaw",
+    "alaw": "alaw",
+}
+
 
 class XAIVoiceError(Exception):
     """Raised when an xAI voice API call fails."""
@@ -134,6 +153,81 @@ async def async_list_voices(
     return voices or dict(XAI_VOICES)
 
 
+def _exact_int(value: Any) -> int | None:
+    """Return an int when ``value`` is an integer, or None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
+    return None
+
+
+def tts_output_format(
+    preferred_format: str | None = None,
+    preferred_sample_rate: Any = None,
+    preferred_bitrate: Any = None,
+) -> tuple[str, dict[str, Any]]:
+    """Map a preferred format onto an xAI ``output_format`` and a file extension.
+
+    Codecs xAI documents are ``mp3``, ``wav``, ``pcm``, ``mulaw`` (or ``ulaw``),
+    and ``alaw``. ``raw`` is sent as ``pcm`` and reported back as ``raw``.
+    ``ogg``, ``oga``, ``opus``, and any other name are requested as MP3.
+
+    A preferred sample rate is sent only when it is one of 8000, 16000, 22050,
+    24000, 44100, or 48000. A preferred bit rate is sent only for MP3, and only
+    when it is one of 32000, 64000, 96000, 128000, or 192000. An out-of-range
+    MP3 pair stays at 24 kHz / 128 kbps. Other codecs omit ``bit_rate`` and use
+    24 kHz when the sample rate is missing or not in that list.
+    """
+    name = (
+        preferred_format.strip().lower()
+        if isinstance(preferred_format, str)
+        else ""
+    )
+    codec = _PREFERRED_TO_CODEC.get(name)
+    sample_rate = _exact_int(preferred_sample_rate)
+    bit_rate = _exact_int(preferred_bitrate)
+    if codec is None:
+        codec = "mp3"
+        extension = "mp3"
+    else:
+        extension = name
+
+    if codec == "mp3":
+        rate_allowed = sample_rate is None or sample_rate in _TTS_SAMPLE_RATES
+        bit_allowed = bit_rate is None or bit_rate in _TTS_MP3_BIT_RATES
+        if rate_allowed and bit_allowed:
+            output_rate = (
+                sample_rate
+                if sample_rate in _TTS_SAMPLE_RATES
+                else _DEFAULT_TTS_SAMPLE_RATE
+            )
+            output_bit_rate = (
+                bit_rate if bit_rate in _TTS_MP3_BIT_RATES else _DEFAULT_TTS_BIT_RATE
+            )
+        else:
+            output_rate = _DEFAULT_TTS_SAMPLE_RATE
+            output_bit_rate = _DEFAULT_TTS_BIT_RATE
+        return extension, {
+            "codec": "mp3",
+            "sample_rate": output_rate,
+            "bit_rate": output_bit_rate,
+        }
+
+    output_rate = (
+        sample_rate if sample_rate in _TTS_SAMPLE_RATES else _DEFAULT_TTS_SAMPLE_RATE
+    )
+    return extension, {"codec": codec, "sample_rate": output_rate}
+
+
 async def async_tts(
     session: ClientSession,
     api_key: str,
@@ -142,8 +236,11 @@ async def async_tts(
     voice_id: str = "eve",
     language: str = "en",
     speed: float = 1.0,
-) -> bytes:
-    """Synthesize speech; returns raw MP3 bytes."""
+    preferred_format: str | None = None,
+    preferred_sample_rate: Any = None,
+    preferred_bitrate: Any = None,
+) -> tuple[str, bytes]:
+    """Synthesize speech; returns the file extension and audio bytes."""
     if not text or not text.strip():
         raise XAIVoiceError("Empty TTS text")
     # xAI max 15_000 chars per request
@@ -152,15 +249,16 @@ async def async_tts(
         message = message[:15000]
 
     lang = normalize_tts_language(language)
+    extension, output_format = tts_output_format(
+        preferred_format,
+        preferred_sample_rate,
+        preferred_bitrate,
+    )
     payload: dict[str, Any] = {
         "text": message,
         "voice_id": voice_id or "eve",
         "language": lang,
-        "output_format": {
-            "codec": "mp3",
-            "sample_rate": 24000,
-            "bit_rate": 128000,
-        },
+        "output_format": output_format,
     }
     if speed and abs(speed - 1.0) > 0.01:
         payload["speed"] = max(0.7, min(1.5, float(speed)))
@@ -190,8 +288,8 @@ async def async_tts(
                 audio_b64 = data.get("audio")
                 if not audio_b64:
                     raise XAIVoiceError("TTS JSON response missing audio")
-                return base64.b64decode(audio_b64)
-            return body
+                return extension, base64.b64decode(audio_b64)
+            return extension, body
     except ClientError as err:
         raise XAIVoiceError(f"xAI TTS network error: {err}") from err
 
