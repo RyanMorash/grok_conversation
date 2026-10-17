@@ -37,14 +37,14 @@
           "data": {
             "name": "[%key:common::config_flow::data::name%]",
             "chat_model": "Chat model",
-            "image_model": "Image model (optional, for future generate_image)",
+            "image_model": "Image model",
             "recommended": "Use recommended sampling settings",
             "max_tokens": "Maximum tokens",
             "temperature": "Temperature"
           },
           "data_description": {
             "chat_model": "Model used for ai_task.generate_data. Options come from GET /v1/models.",
-            "image_model": "Reserved for ai_task.generate_image (deferred). Default grok-imagine-image.",
+            "image_model": "Model used for ai_task.generate_image. Default grok-imagine-image.",
             "recommended": "When enabled, uses default max tokens and temperature."
           }
         }
@@ -214,6 +214,9 @@
     },
     "token_length": {
       "message": "That reply was cut off. Raise the token limit and try again."
+    },
+    "image_edit_unsupported": {
+      "message": "Grok Imagine cannot edit this attachment."
     }
   },
   "issues": {
