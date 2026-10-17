@@ -6,6 +6,9 @@ import logging
 from typing import Any
 
 from homeassistant.components.tts import (
+    ATTR_PREFERRED_BITRATE,
+    ATTR_PREFERRED_FORMAT,
+    ATTR_PREFERRED_SAMPLE_RATE,
     ATTR_VOICE,
     TextToSpeechEntity,
     TtsAudioType,
@@ -68,7 +71,14 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
     # Standalone name — avoid "Grok xAI Grok" from device + entity name concat
     _attr_has_entity_name = False
     _attr_name = "xAI TTS"
-    _attr_supported_options = [ATTR_VOICE]
+    # Preferred format options reach the engine only when listed here.
+    # Otherwise Home Assistant strips them and converts with FFmpeg.
+    _attr_supported_options = [
+        ATTR_VOICE,
+        ATTR_PREFERRED_FORMAT,
+        ATTR_PREFERRED_SAMPLE_RATE,
+        ATTR_PREFERRED_BITRATE,
+    ]
 
     def __init__(
         self, config_entry: ConfigEntry, voices: dict[str, str]
@@ -114,7 +124,7 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
     async def async_get_tts_audio(
         self, message: str, language: str, options: dict[str, Any]
     ) -> TtsAudioType:
-        """Generate MP3 audio via xAI /v1/tts."""
+        """Generate audio via xAI /v1/tts in the caller's preferred format."""
         voice_id = options.get(
             ATTR_VOICE,
             self._entry.options.get(CONF_TTS_VOICE, RECOMMENDED_TTS_VOICE),
@@ -131,19 +141,26 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
         session = async_get_clientsession(self.hass)
 
         _LOGGER.debug(
-            "xAI TTS: voice=%s lang=%s chars=%s", voice_id, lang, len(message or "")
+            "xAI TTS: voice=%s lang=%s format=%s chars=%s",
+            voice_id,
+            lang,
+            options.get(ATTR_PREFERRED_FORMAT) or "mp3",
+            len(message or ""),
         )
         try:
-            audio = await async_tts(
+            extension, audio = await async_tts(
                 session,
                 api_key,
                 text=message,
                 voice_id=str(voice_id),
                 language=lang,
                 speed=speed,
+                preferred_format=options.get(ATTR_PREFERRED_FORMAT),
+                preferred_sample_rate=options.get(ATTR_PREFERRED_SAMPLE_RATE),
+                preferred_bitrate=options.get(ATTR_PREFERRED_BITRATE),
             )
         except XAIVoiceError as err:
             _LOGGER.error("xAI TTS error: %s", err)
             raise HomeAssistantError(str(err)) from err
 
-        return "mp3", audio
+        return extension, audio
