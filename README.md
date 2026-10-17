@@ -32,7 +32,7 @@ Replace Piper / speech-to-phrase with Grok cloud quality while keeping your Sate
 | **xAI TTS** | 25+ expressive voices (Eve, Ara, Rex, Luna, …), speed, languages |
 | **xAI STT** | Multilingual transcription (25+ languages), PCM/WAV from Assist satellites |
 | **Voice API check** | Probes the key for Voice access at setup; warns if chat-only |
-| **Interaction modes** | `tools` · `pipeline` · `chat_only` |
+| **Interaction modes** | `tools` · `chat_only` |
 | **Live Search** | Web / X / Full + citations |
 | **Services** | `ask`, `photo_analysis`, `home_briefing`, image/content generation |
 
@@ -101,7 +101,7 @@ Setup probes your key against the Voice endpoints. If chat works but TTS/STT fai
 | TTS speed | 0.7–1.5 |
 | Default STT language | Formatting language for transcripts |
 | Live Search | off / web / x / full |
-| Interaction mode | tools / pipeline / chat_only |
+| Interaction mode | tools / chat_only |
 | AI Task subentry | Name, chat model, optional image model (generate_image deferred) |
 
 ---

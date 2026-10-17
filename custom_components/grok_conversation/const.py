@@ -191,11 +191,12 @@ LIVE_SEARCH_OPTIONS = [
     LIVE_SEARCH_FULL,
 ]
 
-# Interaction modes
+# Interaction modes. A stored "pipeline" value is tools: Assist already
+# decides local intents before this agent runs.
 MODE_TOOLS = "tools"  # Direct tool calling against HA LLM API
-MODE_PIPELINE = "pipeline"  # Try HA Assist intent first, fall back to Grok tools
 MODE_CHAT_ONLY = "chat_only"  # Pure chat, no device control
-INTERACTION_MODE_OPTIONS = [MODE_TOOLS, MODE_PIPELINE, MODE_CHAT_ONLY]
+INTERACTION_MODE_OPTIONS = [MODE_TOOLS, MODE_CHAT_ONLY]
+_STORED_PIPELINE_MODE = "pipeline"
 
 # Rough default USD pricing per 1M tokens (overridden if API exposes pricing)
 DEFAULT_INPUT_PRICE_PER_M = 3.0
@@ -227,6 +228,15 @@ Critical rules:
 - For general knowledge (history, science, definitions): answer from training data.
 - Keep spoken Assist replies concise (1-3 sentences) unless the user asks for detail.
 """
+
+
+def effective_interaction_mode(stored: object) -> str:
+    """Return the mode to run. A saved pipeline value is tools."""
+    if stored == _STORED_PIPELINE_MODE:
+        return MODE_TOOLS
+    if isinstance(stored, str) and stored:
+        return stored
+    return RECOMMENDED_INTERACTION_MODE
 
 
 def prompt_for_interaction(mode: str | None, stored: str | None) -> str | None:
