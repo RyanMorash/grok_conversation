@@ -490,16 +490,18 @@ async def test_auth_and_connection_errors_do_not_two_pass(
     """Revoked keys and outages stay on normal error handling."""
     await _use_options(hass, mock_config_entry, **{CONF_LIVE_SEARCH: LIVE_SEARCH_WEB})
     tool = _RecordingTool()
-    for exc, match in (
-        (XAIAuthError("revoked"), "revoked"),
-        (XAIConnectionError("unreachable"), "unreachable"),
-        (XAIError("primary down"), "primary down"),
+    for exc, key in (
+        (XAIAuthError("revoked"), "auth_failed"),
+        (XAIConnectionError("unreachable"), "cannot_connect"),
+        (XAIError("primary down"), "cannot_connect"),
     ):
         mock_xai_client.chat.create.reset_mock()
         mock_xai_client.chat.create.return_value.sample = AsyncMock()
         _install_raising_stream(mock_xai_client, exc)
-        with pytest.raises(HomeAssistantError, match=match):
+        with pytest.raises(HomeAssistantError) as caught:
             await _turn(hass, mock_config_entry, "latest score", tool=tool)
+        assert caught.value.translation_key == key
+        assert str(exc) not in str(caught.value)
         assert mock_xai_client.chat.create.return_value.sample.await_count == 0
         assert mock_xai_client.chat.create.call_count >= 1
         for call in mock_xai_client.chat.create.call_args_list:
@@ -516,8 +518,10 @@ async def test_combined_rate_limit_does_not_two_pass(
     await _use_options(hass, mock_config_entry, **{CONF_LIVE_SEARCH: LIVE_SEARCH_WEB})
     tool = _RecordingTool()
     _install_streams(mock_xai_client, [_raise_gen(XAIRateLimitError("quota"))])
-    with pytest.raises(HomeAssistantError, match="Rate limited or insufficient funds"):
+    with pytest.raises(HomeAssistantError) as caught:
         await _turn(hass, mock_config_entry, "latest score", tool=tool)
+    assert caught.value.translation_key == "rate_limit"
+    assert "quota" not in str(caught.value)
     assert mock_xai_client.chat.create.return_value.sample.await_count == 0
     assert mock_xai_client.chat.create.call_count == 1
 
