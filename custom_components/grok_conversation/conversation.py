@@ -71,6 +71,8 @@ from .entity import (
 )
 from .exceptions import raise_translated_xai_error
 
+PARALLEL_UPDATES = 0
+
 # Room names ("family room", "guest bedroom") and shopping lists are not
 # presence requests. Require an explicit people or presence question.
 # Short words use boundaries so "personal" and "train" do not count.
