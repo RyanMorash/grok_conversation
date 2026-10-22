@@ -6,7 +6,7 @@ import re
 from typing import Any, Literal
 
 from homeassistant.components import conversation
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.const import CONF_LLM_HASS_API, MATCH_ALL
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -27,6 +27,8 @@ from .api_helpers import (
 from .const import (
     CONF_AUTO_MODEL_ROUTING,
     CONF_CHAT_MODEL,
+    SUBENTRY_CONVERSATION,
+    effective_agent_options,
     CONF_FALLBACK_MODEL,
     CONF_FAST_MODEL,
     CONF_HOME_CONTEXT,
@@ -146,8 +148,22 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up conversation entities."""
-    agent = OpenAIConversationEntity(config_entry)
-    async_add_entities([agent])
+    subentries = [
+        subentry
+        for subentry in config_entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_CONVERSATION
+    ]
+    for index, subentry in enumerate(subentries):
+        async_add_entities(
+            [
+                OpenAIConversationEntity(
+                    config_entry,
+                    subentry,
+                    register_entry_agent=index == 0,
+                )
+            ],
+            config_subentry_id=subentry.subentry_id,
+        )
 
 
 class OpenAIConversationEntity(
@@ -161,19 +177,38 @@ class OpenAIConversationEntity(
     _attr_name = None
     _attr_supports_streaming = True
 
-    def __init__(self, entry: GrokConfigEntry) -> None:
+    def __init__(
+        self,
+        entry: GrokConfigEntry,
+        subentry: ConfigSubentry,
+        *,
+        register_entry_agent: bool,
+    ) -> None:
         """Initialize the agent."""
-        GrokBaseLLMEntity.__init__(self, entry, None)
+        GrokBaseLLMEntity.__init__(self, entry, subentry)
         self.entry = entry
-        self._attr_unique_id = entry.entry_id
+        self._register_entry_agent = register_entry_agent
+        chat_model = remap_retired_chat_model(
+            self._llm_options().get(CONF_CHAT_MODEL), RECOMMENDED_CHAT_MODEL
+        )
         self._attr_device_info = dr.DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.title,
+            identifiers={(DOMAIN, subentry.subentry_id)},
+            name=subentry.title,
             manufacturer="xAI",
-            model="Grok",
+            model=chat_model,
             entry_type=dr.DeviceEntryType.SERVICE,
         )
         self._attr_supported_features = conversation.ConversationEntityFeature(0)
+
+    def _llm_options(self) -> dict[str, Any]:
+        """Return this agent's settings.
+
+        The original agent follows the config entry options. Another agent
+        uses the copy stored on its subentry.
+        """
+        if self.subentry is None:
+            return dict(self.entry.options)
+        return effective_agent_options(self.entry.options, self.subentry.data)
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -184,16 +219,20 @@ class OpenAIConversationEntity(
         """When entity is added to Home Assistant."""
         await super().async_added_to_hass()
         self._update_control_feature()
-        conversation.async_set_agent(self.hass, self.entry, self)
-        self.entry.async_on_unload(
-            self.entry.add_update_listener(self._async_entry_update_listener)
-        )
+        if self._register_entry_agent:
+            # Assist pipelines that still store the config entry id keep
+            # this original agent. Extra agents are selected by entity id.
+            conversation.async_set_agent(self.hass, self.entry, self)
+            self.entry.async_on_unload(
+                self.entry.add_update_listener(self._async_entry_update_listener)
+            )
 
     def _update_control_feature(self) -> None:
+        options = self._llm_options()
         mode = effective_interaction_mode(
-            self.entry.options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
+            options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
         )
-        api_ids = active_llm_api_ids(self.entry.options.get(CONF_LLM_HASS_API))
+        api_ids = active_llm_api_ids(options.get(CONF_LLM_HASS_API))
         if mode == MODE_CHAT_ONLY or not api_ids:
             self._attr_supported_features = conversation.ConversationEntityFeature(0)
             return
@@ -210,7 +249,8 @@ class OpenAIConversationEntity(
 
     async def async_will_remove_from_hass(self) -> None:
         """When entity will be removed from Home Assistant."""
-        conversation.async_unset_agent(self.hass, self.entry)
+        if self._register_entry_agent:
+            conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
     async def _async_handle_message(
@@ -256,7 +296,7 @@ class OpenAIConversationEntity(
         Person presence and weather are added only when home context is on
         and the utterance asks about people, presence, or weather.
         """
-        options = self.entry.options
+        options = self._llm_options()
         parts: list[str] = []
 
         location = (options.get(CONF_LOCATION_CONTEXT) or "").strip()
@@ -307,7 +347,7 @@ class OpenAIConversationEntity(
         self, user_input: conversation.ConversationInput
     ) -> str:
         """Voice-style and user-name hints (not required for search grounding)."""
-        options = self.entry.options
+        options = self._llm_options()
         parts: list[str] = []
 
         if options.get(CONF_VOICE_OPTIMIZED, RECOMMENDED_VOICE_OPTIMIZED):
@@ -500,7 +540,7 @@ class OpenAIConversationEntity(
         chat_log: conversation.ChatLog,
     ) -> conversation.ConversationResult:
         """Inner method that handles the actual conversation logic."""
-        options = self.entry.options
+        options = self._llm_options()
         mode = effective_interaction_mode(
             options.get(CONF_INTERACTION_MODE, RECOMMENDED_INTERACTION_MODE)
         )

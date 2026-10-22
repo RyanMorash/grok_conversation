@@ -17,13 +17,18 @@ from homeassistant.components.stt import (
     SpeechResultState,
     SpeechToTextEntity,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    STT_DEVICE_MODEL,
+    SUBENTRY_STT,
+    effective_agent_options,
+)
 from .voice_api import XAIVoiceError, async_stt
 from .voice_const import (
     CONF_STT_LANGUAGE,
@@ -40,30 +45,41 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up xAI STT entity from a config entry."""
+    """Set up xAI STT entities from STT subentries."""
     if not config_entry.options.get("enable_stt", True):
         _LOGGER.debug("xAI STT disabled in options")
         return
-    async_add_entities([XAIGrokSTTEntity(config_entry)])
+    for subentry in config_entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_STT:
+            continue
+        async_add_entities(
+            [XAIGrokSTTEntity(config_entry, subentry)],
+            config_subentry_id=subentry.subentry_id,
+        )
 
 
 class XAIGrokSTTEntity(SpeechToTextEntity):
     """xAI STT engine (appears in Assist → Speech-to-text)."""
 
-    # Standalone name — avoid "Grok xAI Grok" from device + entity name concat
+    # Match OpenAI STT: the entity name is the subentry title.
     _attr_has_entity_name = False
-    _attr_name = "xAI STT"
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
+    def __init__(self, config_entry: ConfigEntry, subentry: ConfigSubentry) -> None:
         self._entry = config_entry
-        self._attr_unique_id = f"{config_entry.entry_id}_stt"
+        self._subentry = subentry
+        self._attr_name = subentry.title
+        self._attr_unique_id = subentry.subentry_id
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, config_entry.entry_id)},
-            name=config_entry.title or "xAI Grok",
+            identifiers={(DOMAIN, subentry.subentry_id)},
+            name=subentry.title,
             manufacturer="xAI",
-            model="xAI Voice STT",
+            model=STT_DEVICE_MODEL,
             entry_type=DeviceEntryType.SERVICE,
         )
+
+    def _options(self) -> dict:
+        """Language settings for this engine."""
+        return effective_agent_options(self._entry.options, self._subentry.data)
 
     @property
     def supported_languages(self) -> list[str]:
@@ -109,7 +125,7 @@ class XAIGrokSTTEntity(SpeechToTextEntity):
             _LOGGER.warning("xAI STT: empty audio stream")
             return SpeechResult(None, SpeechResultState.ERROR)
 
-        language = metadata.language or self._entry.options.get(
+        language = metadata.language or self._options().get(
             CONF_STT_LANGUAGE, RECOMMENDED_STT_LANGUAGE
         )
         sample_rate = int(metadata.sample_rate or 16000)
