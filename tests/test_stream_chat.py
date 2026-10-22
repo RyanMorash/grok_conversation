@@ -16,6 +16,7 @@ from homeassistant.helpers import llm
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from xai_sdk.proto import chat_pb2
 
+from custom_components.grok_conversation import conversation as conversation_mod
 from custom_components.grok_conversation.api_helpers import (
     CLIENT_TIMEOUT_SECONDS,
     XAIAuthError,
@@ -32,16 +33,13 @@ from custom_components.grok_conversation.const import (
     DOMAIN,
     LIVE_SEARCH_WEB,
 )
-from custom_components.grok_conversation.conversation import (
-    SATELLITE_STREAM_TIMEOUT_SECONDS,
-)
 from custom_components.grok_conversation.exceptions import TokenLengthExceededError
 
 
 def test_client_timeout_stays_at_two_minutes() -> None:
-    """AI Task keeps the shared client timeout; satellite cuts only the stream."""
+    """The shared client timeout stays; a satellite no longer cuts the stream."""
     assert CLIENT_TIMEOUT_SECONDS == 120.0
-    assert SATELLITE_STREAM_TIMEOUT_SECONDS == 45.0
+    assert not hasattr(conversation_mod, "SATELLITE_STREAM_TIMEOUT_SECONDS")
 
 
 def _chat_response(
@@ -75,12 +73,13 @@ def _pair(
     *,
     content: str | None = None,
     tool_calls=None,
+    chunk_tool_calls=None,
     finish_reason: str = "REASON_STOP",
     citations=None,
 ):
     chunk = MagicMock()
     chunk.content = text
-    chunk.tool_calls = []
+    chunk.tool_calls = [] if chunk_tool_calls is None else chunk_tool_calls
     response = _chat_response(
         content if content is not None else text,
         tool_calls=tool_calls,
@@ -270,7 +269,7 @@ async def test_final_text_is_replayed_as_deltas_not_tool_payloads(
     mock_config_entry: MockConfigEntry,
     mock_xai_client: MagicMock,
 ) -> None:
-    """Tool turns stay on the non-streaming path; the final reply is deltas."""
+    """Tool-call turns enter the delta stream; the final reply is spoken too."""
     tool = _RecordingTool()
     agent = conversation.async_get_agent(hass, mock_config_entry.entry_id)
     assert agent is not None
@@ -310,10 +309,10 @@ async def test_final_text_is_replayed_as_deltas_not_tool_payloads(
     assert tool.calls == [{"action": "turn_on"}]
     assert mock_xai_client.chat.create.return_value.sample.await_count == 0
     heard = "".join(str(delta.get("content") or "") for delta in deltas)
-    assert "preamble" not in heard
+    assert "preamble" in heard
     assert "test_light" not in heard
-    assert all("tool_calls" not in delta for delta in deltas)
-    assert heard == "The light is on."
+    assert any(delta.get("tool_calls") for delta in deltas)
+    assert "The light is on." in heard
     assert any(
         isinstance(item, conversation.AssistantContent)
         and item.content == "The light is on."
@@ -541,52 +540,183 @@ async def test_combined_token_length_does_not_two_pass(
     assert mock_xai_client.chat.create.call_count == 1
 
 
-async def test_satellite_stream_stops_at_patched_timeout(
+async def test_text_is_spoken_before_the_stream_finishes(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_xai_client: MagicMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A satellite turn stops the stream; other turns wait for the rest."""
-    monkeypatch.setattr(
-        "custom_components.grok_conversation.conversation.SATELLITE_STREAM_TIMEOUT_SECONDS",
-        0.05,
+    """A chunk is delivered to Assist before later chunks arrive."""
+    agent = conversation.async_get_agent(hass, mock_config_entry.entry_id)
+    assert agent is not None
+    release = asyncio.Event()
+    first_chunk_taken = asyncio.Event()
+
+    async def _stream():
+        yield _pair("Hello")
+        first_chunk_taken.set()
+        await release.wait()
+        yield _pair(" there", content="Hello there")
+
+    mock_xai_client.chat.create.return_value.stream = _stream
+    chat_log = ChatLog(hass=hass, conversation_id="live-deltas")
+    deltas: list[dict[str, Any]] = []
+    chat_log.delta_listener = lambda _log, delta: deltas.append(dict(delta))
+    chat_log.async_add_user_content(conversation.UserContent(content="Hi"))
+    task = hass.async_create_task(
+        agent._async_handle_chat_log(  # noqa: SLF001
+            chat_log,
+            model="grok-4.3-latest",
+            options={CONF_CHAT_MODEL: "grok-4.3-latest", CONF_FALLBACK_MODEL: ""},
+            messages=[{"role": "user", "content": "Hi"}],
+            agent_id=agent.entity_id,
+            service="conversation",
+            fallback_model="",
+            stream_final=True,
+        )
     )
+    await asyncio.wait_for(first_chunk_taken.wait(), timeout=2)
+    assert any(delta.get("content") == "Hello" for delta in deltas)
+    assert all("there" not in str(delta.get("content") or "") for delta in deltas)
+    release.set()
+    await task
+    assert any(
+        isinstance(item, conversation.AssistantContent)
+        and item.content == "Hello there"
+        for item in chat_log.content
+    )
+
+
+async def test_satellite_runs_a_tool_call_that_arrives_after_a_pause(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """Partial satellite text is not the answer when a tool call is still streaming."""
+    tool = _RecordingTool()
     _install_streams(
         mock_xai_client,
         [
             _gen(
-                [_pair("Hello"), _pair(" world", content="Hello world")],
+                [
+                    _pair("Checking"),
+                    _pair(
+                        "",
+                        content="Checking",
+                        tool_calls=[_tool_call("test_light", '{"action":"turn_on"}')],
+                    ),
+                ],
                 pause_after=1,
-                delay=0.4,
-            )
+                delay=0.3,
+            ),
+            _gen([_pair("The light is on.")]),
+        ],
+    )
+    _agent, _log, result, deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "turn on the light",
+        device_id="satellite-1",
+        tool=tool,
+    )
+    assert tool.calls == [{"action": "turn_on"}]
+    assert _speech(result) == "The light is on."
+    assert "Checking" not in _speech(result)
+    assert any(delta.get("content") == "Checking" for delta in deltas)
+    assert any(delta.get("tool_calls") for delta in deltas)
+
+
+async def test_tool_call_delta_on_the_chunk_runs_once(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A tool-call delta on the chunk is run, and not run again from the response."""
+    tool = _RecordingTool()
+    call = _tool_call("test_light", '{"action":"turn_on"}')
+    _install_streams(
+        mock_xai_client,
+        [
+            _gen(
+                [
+                    _pair(
+                        "Checking",
+                        tool_calls=[call],
+                        chunk_tool_calls=[call],
+                    )
+                ]
+            ),
+            _gen([_pair("The light is on.")]),
+        ],
+    )
+    _agent, _log, result, deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "turn on the light",
+        device_id="satellite-1",
+        tool=tool,
+    )
+    assert tool.calls == [{"action": "turn_on"}]
+    assert _speech(result) == "The light is on."
+    assert any(delta.get("tool_calls") for delta in deltas)
+
+
+async def test_streamed_invalid_tool_json_is_not_executed(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A streamed tool call with bad JSON is returned as an error."""
+    tool = _RecordingTool()
+    _install_streams(
+        mock_xai_client,
+        [
+            _gen([_pair("", tool_calls=[_tool_call("test_light", "{not-json")])]),
+            _gen([_pair("I could not parse that.")]),
         ],
     )
     _agent, _log, result, _deltas = await _turn(
         hass,
         mock_config_entry,
-        "hello there friend",
+        "turn on the light",
         device_id="satellite-1",
+        tool=tool,
+    )
+    assert tool.calls == []
+    assert _speech(result) == "I could not parse that."
+    follow_up = mock_xai_client.chat.create.call_args_list[1].kwargs
+    tool_msgs = [
+        message
+        for message in follow_up["messages"]
+        if _message_role(message) == "tool"
+    ]
+    assert tool_msgs
+    assert "Invalid tool arguments JSON" in _message_text(tool_msgs[0])
+
+
+async def test_streamed_reply_still_strips_trailing_json(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+) -> None:
+    """A spoken stream still drops a trailing JSON object."""
+    _install_streams(
+        mock_xai_client,
+        [
+            _gen(
+                [
+                    _pair("Hello "),
+                    _pair('{"ok": true}', content='Hello {"ok": true}'),
+                ]
+            )
+        ],
+    )
+    _agent, _log, result, deltas = await _turn(
+        hass,
+        mock_config_entry,
+        "hello there friend",
     )
     assert _speech(result) == "Hello"
-    assert "world" not in _speech(result)
-
-    _install_streams(
-        mock_xai_client,
-        [
-            _gen(
-                [_pair("Hello"), _pair(" world", content="Hello world")],
-                pause_after=1,
-                delay=0.4,
-            )
-        ],
-    )
-    _agent, _log, result, _deltas = await _turn(
-        hass,
-        mock_config_entry,
-        "hello there friend",
-    )
-    assert _speech(result) == "Hello world"
+    assert all("ok" not in str(delta.get("content") or "") for delta in deltas)
 
 
 async def test_satellite_reply_omits_citations(
