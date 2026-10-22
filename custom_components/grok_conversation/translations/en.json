@@ -187,6 +187,9 @@
     },
     "image_edit_unsupported": {
       "message": "Grok Imagine cannot edit this attachment."
+    },
+    "cannot_connect": {
+      "message": "Could not reach xAI. Please try again."
     }
   },
   "issues": {

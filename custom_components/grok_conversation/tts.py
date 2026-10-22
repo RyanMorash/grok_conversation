@@ -13,12 +13,12 @@ from homeassistant.components.tts import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN
+from .exceptions import raise_translated_xai_error
 from .voice_api import XAIVoiceError, async_list_voices, async_tts
 from .voice_const import (
     CONF_TTS_LANGUAGE,
@@ -143,7 +143,6 @@ class XAIGrokTTSEntity(TextToSpeechEntity):
                 speed=speed,
             )
         except XAIVoiceError as err:
-            _LOGGER.error("xAI TTS error: %s", err)
-            raise HomeAssistantError(str(err)) from err
+            raise_translated_xai_error(err)
 
         return "mp3", audio
