@@ -88,6 +88,7 @@
           "recheck_voice_access": "Check xAI Voice access again"
         },
         "data_description": {
+          "interaction_mode": "tools = direct HA tool calling; chat_only = no device control.",
           "vision_model": "Fallback for image services and AI Task attachments when the chat model cannot take images. An image-capable chat model always wins; this option is only used as a fallback. Default grok-4.3.",
           "fast_model": "Used when auto-routing detects a short/simple command. Default grok-4.3 (no separate fast model after the May 15 2026 retirement).",
           "fallback_model": "Tried automatically if the primary model errors. Default grok-4.3."
