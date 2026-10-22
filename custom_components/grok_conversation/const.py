@@ -132,7 +132,7 @@ def effective_model_choice(
         return current
     return recommended
 
-# AI Task subentry defaults (generate_image deferred; image_model kept for schema stability)
+# AI Task subentry defaults. image_model is the Imagine model for generate_image.
 DEFAULT_AI_TASK_NAME = "Grok AI Task"
 # Structured / longer AI Task replies need more headroom than Assist (600).
 RECOMMENDED_AI_TASK_MAX_TOKENS = 2500
