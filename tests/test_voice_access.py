@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import ClientError
 import homeassistant.components as ha_components
-from homeassistant.components import conversation
+from homeassistant.components import conversation, tts
+from homeassistant.components.tts.const import DATA_TTS_MANAGER
+from homeassistant.helpers import entity_platform
 
 # The Assist pipeline package init imports pymicro_vad, which is not installed
 # in this test environment. Register the package path so the store models can
@@ -43,10 +45,15 @@ from custom_components.grok_conversation.const import (
     SERVICE_RECHECK_VOICE,
 )
 from custom_components.grok_conversation.repairs import VoiceRecheckFlow
-from custom_components.grok_conversation.voice_api import async_validate_voice_access
+from custom_components.grok_conversation.voice_api import (
+    async_tts,
+    async_validate_voice_access,
+    tts_output_format,
+)
 from custom_components.grok_conversation.voice_const import (
     CONF_RECHECK_VOICE,
     CONF_VOICE_ACCESS,
+    XAI_TTS_URL,
 )
 
 
@@ -560,3 +567,315 @@ async def test_unresolved_device_skips_prewarm_for_long_reply(
             await entity._resolve_continue_conversation(text_input, chat_log, speech)
             is True
         )
+
+
+_MP3_DEFAULT = {"codec": "mp3", "sample_rate": 24000, "bit_rate": 128000}
+
+
+def test_missing_preferred_format_stays_mp3() -> None:
+    """No preferred format keeps the MP3 request at 24 kHz / 128 kbps."""
+    assert tts_output_format(None, None, None) == ("mp3", _MP3_DEFAULT)
+    assert tts_output_format("mp3") == ("mp3", _MP3_DEFAULT)
+
+
+def test_preferred_format_maps_documented_codecs() -> None:
+    """xAI codecs are requested as themselves, and raw is PCM."""
+    assert tts_output_format("mp3") == ("mp3", _MP3_DEFAULT)
+    assert tts_output_format("WAV") == (
+        "wav",
+        {"codec": "wav", "sample_rate": 24000},
+    )
+    assert tts_output_format("pcm", "48000") == (
+        "pcm",
+        {"codec": "pcm", "sample_rate": 48000},
+    )
+    assert tts_output_format("raw", 16000) == (
+        "raw",
+        {"codec": "pcm", "sample_rate": 16000},
+    )
+    for name in ("mulaw", "ulaw", "alaw"):
+        extension, output = tts_output_format(name, 8000)
+        assert extension == name
+        assert output == {"codec": name, "sample_rate": 8000}
+        assert "bit_rate" not in output
+
+
+def test_ogg_and_unknown_formats_fall_back_to_mp3() -> None:
+    """ogg, oga, and opus are not sent, and other names stay MP3."""
+    for name in ("ogg", "oga", "opus", "flac", "aac", "mu-law"):
+        extension, output = tts_output_format(name, 44100, 192000)
+        assert extension == "mp3"
+        assert output["codec"] == "mp3"
+        assert output["codec"] != "opus"
+        assert output == {
+            "codec": "mp3",
+            "sample_rate": 44100,
+            "bit_rate": 192000,
+        }
+
+
+def test_sample_rate_and_bitrate_follow_the_codec() -> None:
+    """Preferred rates are sent only when xAI documents that pair."""
+    assert tts_output_format("mp3", 44100, 192000) == (
+        "mp3",
+        {"codec": "mp3", "sample_rate": 44100, "bit_rate": 192000},
+    )
+    assert tts_output_format("mp3", None, "64000") == (
+        "mp3",
+        {"codec": "mp3", "sample_rate": 24000, "bit_rate": 64000},
+    )
+    assert tts_output_format("mp3", 44100, 999) == ("mp3", _MP3_DEFAULT)
+    assert tts_output_format("mp3", 12345, 192000) == ("mp3", _MP3_DEFAULT)
+    assert tts_output_format("wav", 16000, 128000) == (
+        "wav",
+        {"codec": "wav", "sample_rate": 16000},
+    )
+    assert tts_output_format("wav", 11025) == (
+        "wav",
+        {"codec": "wav", "sample_rate": 24000},
+    )
+
+
+class _TTSResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        content_type: str = "audio/wav",
+    ) -> None:
+        self.status = status
+        self.headers = {"Content-Type": content_type}
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+class _TTSSession:
+    def __init__(self, response: _TTSResponse) -> None:
+        self.response = response
+        self.payloads: list[dict] = []
+        self.urls: list[str] = []
+
+    def post(self, url, **kwargs):
+        self.urls.append(url)
+        self.payloads.append(kwargs["json"])
+        return self.response
+
+
+def _tts_entity(hass: HomeAssistant, entry: MockConfigEntry):
+    """Return the TTS engine for this config entry.
+
+    The engine's unique id is its TTS subentry id, not the config entry id.
+    """
+    for platform in entity_platform.async_get_platforms(hass, DOMAIN):
+        if platform.domain != "tts":
+            continue
+        for entity in platform.entities.values():
+            owner = getattr(entity, "_entry", None)
+            if owner is not None and owner.entry_id == entry.entry_id:
+                return entity
+    raise AssertionError("TTS entity was not set up")
+
+
+async def test_async_tts_posts_preferred_wav() -> None:
+    """The TTS request uses the mapped codec and returns that extension."""
+    session = _TTSSession(_TTSResponse(b"wav-bytes"))
+    extension, audio = await async_tts(
+        session,  # type: ignore[arg-type]
+        "sk",
+        text="Hello",
+        voice_id="ara",
+        preferred_format="wav",
+        preferred_sample_rate=16000,
+        preferred_bitrate=128000,
+    )
+    assert extension == "wav"
+    assert audio == b"wav-bytes"
+    assert session.urls == [XAI_TTS_URL]
+    assert session.payloads == [
+        {
+            "text": "Hello",
+            "voice_id": "ara",
+            "language": "en",
+            "output_format": {"codec": "wav", "sample_rate": 16000},
+        }
+    ]
+
+
+async def test_async_tts_decodes_json_audio_for_mp3() -> None:
+    """A JSON envelope still returns the extension with the decoded bytes."""
+    import base64
+
+    encoded = base64.b64encode(b"mp3-bytes").decode()
+    session = _TTSSession(
+        _TTSResponse(
+            f'{{"audio": "{encoded}"}}'.encode(),
+            content_type="application/json",
+        )
+    )
+    extension, audio = await async_tts(
+        session,  # type: ignore[arg-type]
+        "sk",
+        text="Hello",
+    )
+    assert extension == "mp3"
+    assert audio == b"mp3-bytes"
+    assert session.payloads[0]["output_format"] == _MP3_DEFAULT
+
+
+async def test_tts_entity_returns_preferred_format(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """The engine reports the format it asked xAI for."""
+    entity = _tts_entity(hass, mock_config_entry)
+    assert tts.ATTR_PREFERRED_FORMAT in entity.supported_options
+    assert tts.ATTR_PREFERRED_SAMPLE_RATE in entity.supported_options
+    assert tts.ATTR_PREFERRED_BITRATE in entity.supported_options
+
+    session = _TTSSession(_TTSResponse(b"pcm-bytes", content_type="audio/pcm"))
+    with patch(
+        "custom_components.grok_conversation.tts.async_get_clientsession",
+        return_value=session,
+    ):
+        extension, audio = await entity.async_get_tts_audio(
+            "Hello",
+            "en",
+            {
+                tts.ATTR_VOICE: "eve",
+                tts.ATTR_PREFERRED_FORMAT: "raw",
+                tts.ATTR_PREFERRED_SAMPLE_RATE: 16000,
+            },
+        )
+    assert extension == "raw"
+    assert audio == b"pcm-bytes"
+    assert session.payloads[0]["output_format"] == {
+        "codec": "pcm",
+        "sample_rate": 16000,
+    }
+
+    session = _TTSSession(_TTSResponse(b"mp3-bytes", content_type="audio/mpeg"))
+    with patch(
+        "custom_components.grok_conversation.tts.async_get_clientsession",
+        return_value=session,
+    ):
+        extension, audio = await entity.async_get_tts_audio(
+            "Hello",
+            "en",
+            {tts.ATTR_PREFERRED_FORMAT: "ogg"},
+        )
+    assert extension == "mp3"
+    assert audio == b"mp3-bytes"
+    assert session.payloads[0]["output_format"]["codec"] == "mp3"
+
+
+async def _generate(hass, entity, options: dict):
+    manager = hass.data[DATA_TTS_MANAGER]
+    return b"".join(
+        [
+            chunk
+            async for chunk in manager._async_generate_tts_audio(
+                entity, "Hello", "en", options
+            )
+        ]
+    )
+
+
+async def test_matching_format_skips_ffmpeg(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """A format xAI can produce is returned without an FFmpeg conversion."""
+    entity = _tts_entity(hass, mock_config_entry)
+    session = _TTSSession(_TTSResponse(b"wav-bytes"))
+
+    async def _forbid_convert(*args, **kwargs):
+        raise AssertionError("ffmpeg conversion")
+        yield b""
+
+    with (
+        patch(
+            "custom_components.grok_conversation.tts.async_get_clientsession",
+            return_value=session,
+        ),
+        patch(
+            "homeassistant.components.tts._async_convert_audio",
+            _forbid_convert,
+        ),
+    ):
+        audio = await _generate(
+            hass, entity, {tts.ATTR_PREFERRED_FORMAT: "wav"}
+        )
+    assert audio == b"wav-bytes"
+    assert session.payloads[0]["output_format"] == {
+        "codec": "wav",
+        "sample_rate": 24000,
+    }
+
+
+async def test_manager_forwards_sample_rate_and_converts_ogg(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry
+) -> None:
+    """Listed preferred options reach xAI, and an unsupported format is converted."""
+    entity = _tts_entity(hass, mock_config_entry)
+    conversions: list[tuple] = []
+
+    async def _record_convert(
+        hass_arg,
+        from_extension,
+        audio_input,
+        to_extension=None,
+        to_sample_rate=None,
+        to_sample_channels=None,
+        to_sample_bytes=None,
+        to_bitrate=None,
+    ):
+        conversions.append(
+            (from_extension, to_extension, to_sample_rate, to_bitrate)
+        )
+        async for chunk in audio_input:
+            yield b"converted:" + chunk
+
+    session = _TTSSession(_TTSResponse(b"wav-bytes"))
+    with (
+        patch(
+            "custom_components.grok_conversation.tts.async_get_clientsession",
+            return_value=session,
+        ),
+        patch(
+            "homeassistant.components.tts._async_convert_audio",
+            _record_convert,
+        ),
+    ):
+        wav = await _generate(
+            hass,
+            entity,
+            {
+                tts.ATTR_PREFERRED_FORMAT: "wav",
+                tts.ATTR_PREFERRED_SAMPLE_RATE: 16000,
+                tts.ATTR_PREFERRED_SAMPLE_CHANNELS: 1,
+                tts.ATTR_PREFERRED_SAMPLE_BYTES: 2,
+            },
+        )
+        session.response = _TTSResponse(b"mp3-bytes", content_type="audio/mpeg")
+        ogg = await _generate(
+            hass, entity, {tts.ATTR_PREFERRED_FORMAT: "ogg"}
+        )
+
+    assert session.payloads[0]["output_format"] == {
+        "codec": "wav",
+        "sample_rate": 16000,
+    }
+    assert session.payloads[1]["output_format"] == _MP3_DEFAULT
+    assert wav == b"converted:wav-bytes"
+    assert ogg == b"converted:mp3-bytes"
+    assert conversions[0][0] == "wav"
+    assert conversions[0][1] == "wav"
+    assert conversions[0][2] == 16000
+    assert conversions[1] == ("mp3", "ogg", None, None)
