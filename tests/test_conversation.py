@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import probatio
 import pytest
 import voluptuous as vol
 from homeassistant.components import conversation
@@ -21,6 +23,7 @@ from custom_components.grok_conversation.const import (
     CONF_FALLBACK_MODEL,
     DOMAIN,
 )
+from custom_components.grok_conversation.entity import format_tool
 
 
 def _chat_response(text: str = "", *, tool_calls=None, model: str | None = None):
@@ -77,7 +80,29 @@ class _RecordingTool(llm.Tool):
         return {"ok": True, "action": tool_input.tool_args.get("action")}
 
 
-def _mock_llm_api(hass: HomeAssistant, tool: llm.Tool) -> llm.APIInstance:
+class _UnconvertibleTool(llm.Tool):
+    """Tool whose parameter schema cannot be converted to OpenAPI."""
+
+    name = "broken_schema"
+    description = "Schema cannot be converted"
+
+    async def async_call(
+        self,
+        hass: HomeAssistant,
+        tool_input: llm.ToolInput,
+        llm_context: llm.LLMContext,
+    ) -> dict[str, Any]:
+        return {"ok": False}
+
+
+def _cyclic_schema() -> dict[str, Any]:
+    """Return a schema that probatio.to_openapi refuses to render."""
+    cycle: dict[str, Any] = {}
+    cycle["child"] = cycle
+    return cycle
+
+
+def _mock_llm_api(hass: HomeAssistant, *tools: llm.Tool) -> llm.APIInstance:
     api = MagicMock(spec=llm.API)
     api.hass = hass
     api.id = "test"
@@ -92,7 +117,7 @@ def _mock_llm_api(hass: HomeAssistant, tool: llm.Tool) -> llm.APIInstance:
             assistant="conversation",
             device_id=None,
         ),
-        tools=[tool],
+        tools=list(tools),
     )
 
 
@@ -339,3 +364,72 @@ async def test_invalid_tool_argument_json_returns_error(
     tool_msgs = [m for m in second_kwargs["messages"] if _message_role(m) == "tool"]
     assert tool_msgs
     assert "Invalid tool arguments JSON" in _message_text(tool_msgs[0])
+
+
+def test_format_tool_reraises_when_schema_does_not_convert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A schema that cannot be converted is not replaced with an empty object."""
+    tool = _UnconvertibleTool()
+    tool.parameters = _cyclic_schema()
+
+    with (
+        caplog.at_level("WARNING", logger="custom_components.grok_conversation"),
+        pytest.raises(probatio.SchemaError, match="references itself"),
+    ):
+        format_tool(tool, None)
+
+    assert "broken_schema" in caplog.text
+    assert "empty object schema" not in caplog.text
+
+
+def test_format_tool_keeps_converted_parameters() -> None:
+    """A convertible schema is still sent with its parameters."""
+    formatted = format_tool(_RecordingTool(), None)
+    parameters = formatted["function"]["parameters"]
+    assert parameters["properties"]["action"]["type"] == "string"
+    assert parameters["properties"] != {}
+
+
+async def test_unconvertible_tool_schema_is_omitted_from_request(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_xai_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tool whose schema fails conversion is left out; the rest are sent."""
+    good = _RecordingTool()
+    broken = _UnconvertibleTool()
+    broken.parameters = _cyclic_schema()
+    entity = _conversation_entity(hass, mock_config_entry)
+
+    _set_sample(mock_xai_client, [_chat_response("Done.")])
+
+    chat_log = ChatLog(hass=hass, conversation_id="conv-skip-schema")
+    chat_log.llm_api = _mock_llm_api(hass, broken, good)
+    chat_log.async_add_user_content(
+        conversation.UserContent(content="Turn on the light")
+    )
+
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Turn on the light"},
+    ]
+    with caplog.at_level("WARNING", logger="custom_components.grok_conversation"):
+        await entity._async_handle_chat_log(  # noqa: SLF001
+            chat_log,
+            model="grok-4.3-latest",
+            options={CONF_CHAT_MODEL: "grok-4.3-latest"},
+            messages=messages,
+            agent_id=entity.entity_id,
+            service="conversation",
+            fallback_model="",
+        )
+
+    sent = mock_xai_client.chat.create.call_args_list[0].kwargs["tools"]
+    names = [item.function.name for item in sent]
+    assert names == ["test_light"]
+    parameters = json.loads(sent[0].function.parameters)
+    assert parameters["properties"]["action"]["type"] == "string"
+    assert parameters != {"type": "object", "properties": {}}
+    assert "Skipping tool broken_schema" in caplog.text
