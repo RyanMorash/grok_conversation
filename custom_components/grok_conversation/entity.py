@@ -1153,9 +1153,14 @@ class GrokBaseLLMEntity(Entity):
                         }
                     )
                     if turn.finish_reason == "length":
-                        raise TokenLengthExceededError(
+                        token_error = TokenLengthExceededError(
                             options.get(CONF_MAX_TOKENS, default_max_tokens)
                         )
+                        LOGGER.error(
+                            "xAI reply exceeded the token limit (%s tokens)",
+                            token_error.token,
+                        )
+                        raise token_error
                     break
                 result = await async_chat_completion(client, **completion_kwargs)
             except XAIRateLimitError:
