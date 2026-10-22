@@ -671,11 +671,16 @@ class _TTSSession:
 
 
 def _tts_entity(hass: HomeAssistant, entry: MockConfigEntry):
+    """Return the TTS engine for this config entry.
+
+    The engine's unique id is its TTS subentry id, not the config entry id.
+    """
     for platform in entity_platform.async_get_platforms(hass, DOMAIN):
         if platform.domain != "tts":
             continue
         for entity in platform.entities.values():
-            if entity.unique_id == f"{entry.entry_id}_tts":
+            owner = getattr(entity, "_entry", None)
+            if owner is not None and owner.entry_id == entry.entry_id:
                 return entity
     raise AssertionError("TTS entity was not set up")
 
