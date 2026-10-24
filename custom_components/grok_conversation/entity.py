@@ -1005,7 +1005,7 @@ class GrokBaseLLMEntity(Entity):
                     "role": "tool_result",
                     "tool_call_id": call.id,
                     "tool_name": call.name,
-                    "result": llm.ToolResult(data=payload),
+                    "result": llm.ToolResult(data=payload, error=True),
                 }
             return
 
@@ -1217,8 +1217,8 @@ class GrokBaseLLMEntity(Entity):
                 tool_call_tasks: dict[str, Any] | None = None
                 if parse_errors:
 
-                    async def _const_result(payload: dict[str, Any]) -> dict[str, Any]:
-                        return payload
+                    async def _const_result(payload: dict[str, Any]) -> llm.ToolResult:
+                        return llm.ToolResult(data=payload, error=True)
 
                     tool_call_tasks = {
                         call_id: self.hass.async_create_task(
@@ -1232,16 +1232,14 @@ class GrokBaseLLMEntity(Entity):
                     assistant_content,
                     tool_call_tasks=tool_call_tasks,
                 ):
+                    tool_result = getattr(tool_response, "result", None)
+                    if tool_result is None:
+                        tool_result = getattr(tool_response, "tool_result", None)
                     tool_messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_response.tool_call_id,
-                            "content": _tool_result_payload(
-                                getattr(tool_response, "tool_result", None)
-                                if getattr(tool_response, "tool_result", None)
-                                is not None
-                                else getattr(tool_response, "result", None)
-                            ),
+                            "content": _tool_result_payload(tool_result),
                         }
                     )
 

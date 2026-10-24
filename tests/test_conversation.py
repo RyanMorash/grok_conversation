@@ -75,9 +75,11 @@ class _RecordingTool(llm.Tool):
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> dict[str, Any]:
+    ) -> llm.ToolResult:
         self.calls.append(dict(tool_input.tool_args))
-        return {"ok": True, "action": tool_input.tool_args.get("action")}
+        return llm.ToolResult(
+            data={"ok": True, "action": tool_input.tool_args.get("action")}
+        )
 
 
 class _UnconvertibleTool(llm.Tool):
@@ -91,8 +93,8 @@ class _UnconvertibleTool(llm.Tool):
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> dict[str, Any]:
-        return {"ok": False}
+    ) -> llm.ToolResult:
+        return llm.ToolResult(data={"ok": False})
 
 
 def _cyclic_schema() -> dict[str, Any]:
