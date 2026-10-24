@@ -199,14 +199,35 @@ def _kwargs_for(model: str, effort: str | None) -> dict:
     )
 
 
-def test_reasoning_effort_sent_for_grok_43_ids() -> None:
-    """Current grok-4.3 ids receive reasoning_effort even without the word."""
-    assert _kwargs_for("grok-4.3", "low")["reasoning_effort"] == "low"
+def test_reasoning_effort_sent_for_documented_ids() -> None:
+    """Documented families receive reasoning_effort; other ids do not."""
+    for model in (
+        "grok-4.3",
+        "grok-4.3-latest",
+        "grok-4.5",
+        "grok-4.5-latest",
+        "grok-4.6",
+        "grok-4.6-latest",
+        "grok-4.7",
+        "grok-build-latest",
+        "grok-4.20-multi-agent",
+    ):
+        assert _kwargs_for(model, "low")["reasoning_effort"] == "low"
     assert _kwargs_for("grok-4.3-latest", "high")["reasoning_effort"] == "high"
-    assert _kwargs_for("grok-4-1-fast-reasoning", "medium")["reasoning_effort"] == "medium"
-    assert "reasoning_effort" not in _kwargs_for("grok-4.6", "low")
+    assert _kwargs_for("  grok-4.6  ", " Medium ")["reasoning_effort"] == "medium"
+    for model in (
+        "grok-4-1-fast-reasoning",
+        "grok-4-1-fast-non-reasoning",
+        "something-non-reasoning",
+        "grok-4",
+        "grok-4-latest",
+        "grok-4.30",
+    ):
+        assert "reasoning_effort" not in _kwargs_for(model, "low")
     assert "reasoning_effort" not in _kwargs_for("grok-4.3", "none")
+    assert "reasoning_effort" not in _kwargs_for("grok-4.3", " None ")
     assert "reasoning_effort" not in _kwargs_for("grok-4.3", None)
+    assert "reasoning_effort" not in _kwargs_for("grok-4.3", "  ")
 
 
 def _sample_response() -> MagicMock:

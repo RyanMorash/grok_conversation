@@ -501,24 +501,47 @@ def chat_result_from_response(response: Any) -> ChatResult:
 # Models that rejected reasoning_effort. Logged once, then omitted.
 _REASONING_EFFORT_REJECTED: set[str] = set()
 
+# Families documented to accept reasoning_effort. Prefix match is exact or
+# ``prefix-`` so ``grok-4.30`` does not match ``grok-4.3``.
+# ``*-non-reasoning*`` is always excluded. Retired ``*-reasoning`` ids and
+# bare ``grok-4`` are omitted until xAI documents an effort list for them.
+_REASONING_EFFORT_ID_PREFIXES: tuple[str, ...] = (
+    "grok-4.3",
+    "grok-4.5",
+    "grok-4.6",
+    "grok-4.7",
+    "grok-build-latest",
+)
+
 
 def _model_sends_reasoning_effort(model: str) -> bool:
-    """Return True when this id should receive reasoning_effort."""
+    """Return True when this id should receive reasoning_effort.
+
+    Allow-listed families and ``*multi-agent*`` ids return True.
+    ``*-non-reasoning*`` and everything else return False.
+    """
     if model in _REASONING_EFFORT_REJECTED:
         return False
-    lowered = model.lower()
-    if "reasoning" in lowered:
+    name = (model or "").strip().lower()
+    if not name or "non-reasoning" in name:
+        return False
+    if "multi-agent" in name:
         return True
-    # grok-4.3 supports effort but the id does not contain "reasoning".
-    return lowered == "grok-4.3" or lowered.startswith("grok-4.3-")
+    return any(
+        name == prefix or name.startswith(f"{prefix}-")
+        for prefix in _REASONING_EFFORT_ID_PREFIXES
+    )
 
 
 def _maybe_reasoning_effort(model: str, reasoning_effort: str | None) -> str | None:
-    if not reasoning_effort or reasoning_effort == "none":
+    if reasoning_effort is None:
+        return None
+    effort = str(reasoning_effort).strip().lower()
+    if not effort or effort == "none":
         return None
     if not _model_sends_reasoning_effort(model):
         return None
-    return reasoning_effort
+    return effort
 
 
 _UNSUPPORTED_FIELD_PHRASES = (
